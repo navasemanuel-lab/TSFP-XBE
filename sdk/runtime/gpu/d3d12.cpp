@@ -4176,12 +4176,15 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh) 
     // by their pixel centres: geometry reaching up to half a pixel past one is cut there, and the piece beside it,
     // drawn from its own edge, covers the console's next centre. Upscaled, host pixels fall between the cut and that
     // edge and neither paints them: see-through lines along doorways that come and go with the camera. Each edge moves
-    // out half a console pixel, rounded inwards to host pixels, so at the console's size it is where it was.
+    // out half a console pixel and keeps the host pixels whose centres fall strictly inside, so at the console's size
+    // it is where it was (rounding the edge itself to host pixels dropped a column the console paints).
     if (s.scissor_count) {
-        x0 = std::max(x0, LONG(std::ceil((float(int32_t(s.scissors[0])) - 0.5f) * sx)));
-        y0 = std::max(y0, LONG(std::ceil((float(int32_t(s.scissors[1])) - 0.5f) * sy)));
-        x1 = std::min(x1, LONG(std::floor((float(int32_t(s.scissors[2])) + 0.5f) * sx)));
-        y1 = std::min(y1, LONG(std::floor((float(int32_t(s.scissors[3])) + 0.5f) * sy)));
+        auto from = [](int32_t e, float k) { return LONG(std::floor((float(e) - 0.5f) * k - 0.5f)) + 1; };
+        auto to = [](int32_t e, float k) { return LONG(std::ceil((float(e) + 0.5f) * k - 0.5f)); };
+        x0 = std::max(x0, from(int32_t(s.scissors[0]), sx));
+        y0 = std::max(y0, from(int32_t(s.scissors[1]), sy));
+        x1 = std::min(x1, to(int32_t(s.scissors[2]), sx));
+        y1 = std::min(y1, to(int32_t(s.scissors[3]), sy));
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
