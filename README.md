@@ -6,6 +6,14 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 > [!NOTE]
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game (US Xbox release) to install or build.
 
+<p align="center">
+  <img src="docs/screenshots/scotland-boat.webp" width="100%" alt="Scotland, the boat to the castle">
+</p>
+<p align="center">
+  <img src="docs/screenshots/scotland-castle.webp" width="49%" alt="Scotland, the castle road">
+  <img src="docs/screenshots/mansion-hall.webp" width="49%" alt="The mansion hall">
+</p>
+
 ## Download
 Get `TSFP.zip` from the [latest release](https://github.com/navasemanuel-lab/TSFP-XBE/releases/latest). The launcher inside installs every later release by itself.
 
@@ -31,6 +39,7 @@ Get `TSFP.zip` from the [latest release](https://github.com/navasemanuel-lab/TSF
 - **Multisample Antialiasing (MSAA)** - 2x, 4x or 8x MSAA smooths jagged edges while keeping the image sharp. It does not smooth alpha-tested edges such as fences and foliage.
 - **Edge Smoothing** - FXAA or SMAA over the whole frame, alpha-tested edges included. SMAA keeps text and straight lines sharp, and either can be combined with MSAA.
 - **Anisotropic Filtering** - Up to 16x on all textures.
+- **Ambient Occlusion** - Soft contact shadows where surfaces meet, SSAO or GTAO, worked out at half size.
 - **Effect Toggles** - Switch fog, rain, blood and the first-person hands on or off.
 - **PC Fixes** - Falling rain shown, decals at any field of view, overlays that went black at high fields of view fixed, and a cheaper glow pass at high resolutions.
 
@@ -125,6 +134,9 @@ Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and 
 ### 4. Build the Project
 - Run `build.bat`. The first build recompiles the entire game and takes a while.
 - When it finishes, run `out\build\release\TSFP.exe`.
+
+## How This Port Was Made
+This port is developed with [Claude Code](https://claude.com/claude-code), Anthropic's AI coding assistant. Claude does most of the reverse engineering of the game's code and writes most of the port's code (the runtime fixes, renderer, mods, online play and tools), directed by the project's author, who decides what goes in, tests every change in the game and reports what is wrong. Commits made this way carry a `Co-Authored-By: Claude` line.
 
 ## Credits
 - [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp), the recompiler and runtime this port is built on.
