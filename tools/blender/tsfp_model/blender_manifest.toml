@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "tsfp_model"
+version = "1.0.0"
+name = "TimeSplitters Future Perfect models"
+tagline = "Open the game's models, edit them and write them into a mod"
+maintainer = "TSFP XBE Recomp"
+type = "add-on"
+license = ["SPDX:GPL-3.0-or-later"]
+blender_version_min = "4.2.0"
+tags = ["Import-Export", "Game Engine"]
+
+[permissions]
+files = "Read the game's paks, write models and textures into its mods folder"

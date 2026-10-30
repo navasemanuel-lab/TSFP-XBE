@@ -28,15 +28,17 @@ Get `TSFP.zip` from the [latest release](https://github.com/navasemanuel-lab/TSF
 - **Shader Cache** - Shaders and pipelines are cached and built ahead at start, so levels don't stutter the first time.
 
 ### Graphics
-- **Antialiasing** - FXAA or SMAA.
+- **Multisample Antialiasing (MSAA)** - 2x, 4x or 8x MSAA smooths jagged edges while keeping the image sharp. It does not smooth alpha-tested edges such as fences and foliage.
+- **Edge Smoothing** - FXAA or SMAA over the whole frame, alpha-tested edges included. SMAA keeps text and straight lines sharp, and either can be combined with MSAA.
 - **Anisotropic Filtering** - Up to 16x on all textures.
 - **Effect Toggles** - Switch fog, rain, blood and the first-person hands on or off.
 - **PC Fixes** - Falling rain shown, decals at any field of view, overlays that went black at high fields of view fixed, and a cheaper glow pass at high resolutions.
 
 ### Input
 - **Mouse and Keyboard** - 1:1 mouse aiming with sensitivity, vertical speed and invert. The mouse works in every menu, on the on-screen keyboards and in MapMaker.
-- **Rebindable Controls** - Every action takes up to three keys. The keyboard can be its own player, with controllers on ports 2 to 4.
+- **Rebindable Controls** - Every action takes up to three keys, and 1 to 9 and 0 pick the weapons in your inventory. The keyboard can be its own player, with controllers on ports 2 to 4.
 - **Controller** - Xbox, PlayStation and Switch controllers with hot plugging, rumble, dead zone and aim curve. Button prompts and the Controls screen match the controller in use, and name your keys on the keyboard.
+- **Gyro Aiming** - Controllers with motion sensors, such as the DualSense, DualShock 4 and Switch Pro Controller, can turn the view by turning the controller, held at any tilt and working together with the right stick, with adjustable speed.
 
 ### Gameplay
 - **Skip Intro and Cutscenes** - Skip the intro videos or any cutscene, plus fast loading and quit to desktop from the menus.
@@ -89,11 +91,45 @@ If something goes wrong, send the `logs` folder of both PCs.
 ### Minimum
 - **OS**
   - Windows 10 64-bit
+- **CPU** with 2 cores and support for SSE4.2 and POPCNT
+  - Intel Nehalem (Intel Core 1st Generation)
+  - AMD Bulldozer (AMD FX series)
 - **GPU** with support for Direct3D 12
+  - NVIDIA GeForce GT 630 (Kepler)
+  - AMD Radeon HD 7750
+  - Intel HD Graphics 510 (Skylake)
+- **Memory**
+  - 4 GB
+- **Storage**
+  - 5 GB for the game files, saves and shader cache
+
+## Building
+### 1. Clone the Repository
+Clone this repository using [Git](https://git-scm.com/), or extract `TSFP-source.zip`.
+```
+git clone https://github.com/navasemanuel-lab/TSFP-XBE.git
+```
+
+### 2. Add the Required Game Files
+Place your extracted game data files in the `assets` folder. `default.xbe` from the US release must be there, with the rest of the game's files beside it.
+
+### 3. Install Dependencies
+Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and select the following **Workloads** and **Individual components**:
+- Desktop development with C++
+- C++ Clang tools for Windows
+- C++ CMake tools for Windows
+
+> [!TIP]
+> `build.bat` offers to install the Clang and CMake components for you if they're missing.
+
+### 4. Build the Project
+- Run `build.bat`. The first build recompiles the entire game and takes a while.
+- When it finishes, run `out\build\release\TSFP.exe`.
 
 ## Credits
 - [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp), the recompiler and runtime this port is built on.
 - [lmplied/TSFPRecomp](https://github.com/lmplied/TSFPRecomp) for the lockstep co-op and in-game menu findings.
 - [TheDoffman/timesplitters-future-perfect-pc](https://github.com/TheDoffman/timesplitters-future-perfect-pc) for the System Link bot findings and the Discord presence.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for the overridable function layout and instruction hooks.
+- [Input Prompts Pack](https://forums.unrealengine.com/t/free-assets-input-pack-with-over-1000-icons-for-pc-and-consoles/1215646) by Julio Cacko (CC0) for the controller button icons.
 - [Zydis](https://github.com/zyantific/zydis), [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui) and [SDL](https://github.com/libsdl-org/SDL).

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vista previa Discord</title>
+<style>
+  body { margin: 0; padding: 24px 16px; background: #1e1f22; color: #dbdee1; font-family: "Segoe UI", Arial, sans-serif; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; color: #f2f3f5; }
+  p.note { margin: 0 0 20px; font-size: 13px; color: #949ba4; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+  .option { background: #2b2d31; border-radius: 12px; padding: 16px; }
+  .label { font-size: 13px; font-weight: 600; color: #f2f3f5; margin-bottom: 12px; }
+  .label span { font-weight: 400; color: #949ba4; }
+  .card { background: #111214; border-radius: 8px; padding: 12px; }
+  .head { font-size: 12px; font-weight: 700; color: #b5bac1; margin-bottom: 8px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  .big { width: 80px; height: 80px; border-radius: 8px; flex: none; background-image: url("discord_cover.jpg"); background-repeat: no-repeat; }
+  .text div { font-size: 13px; line-height: 1.35; }
+  .name { font-weight: 700; color: #f2f3f5; }
+  .time { color: #23a55a; }
+  .member { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 6px 8px; border-radius: 4px; background: #313338; }
+  .avatar { width: 32px; height: 32px; border-radius: 50%; background: #5865f2; flex: none; }
+  .member .who { font-size: 14px; color: #f2f3f5; }
+  .member .sub { font-size: 12px; color: #b5bac1; display: flex; align-items: center; gap: 4px; }
+  .tiny { width: 16px; height: 16px; border-radius: 3px; background-image: url("discord_cover.jpg"); background-repeat: no-repeat; }
+  .full { background-size: 100%; background-position: 0 0; }
+  .face { background-size: 250%; background-position: 87.5% 45.8%; }
+  .mid { background-size: 166.7%; background-position: 75% 56%; }
+  .logo { background-size: 118%; background-position: 50% 0%; }
+</style>
+</head>
+<body>
+<h1>Cómo se vería en Discord</h1>
+<p class="note">Arriba: tarjeta de actividad del perfil (80 px). Abajo: lista de miembros (icono de 16 px). Hecho con la portada que me pasaste, recortada de distintas formas.</p>
+<div class="grid">
+
+  <div class="option">
+    <div class="label">A. Portada completa <span>(la de ahora)</span></div>
+    <div class="card"><div class="head">JUGANDO</div><div class="row"><div class="big full"></div>
+      <div class="text"><div class="name">TimeSplitters: Future Perfect</div><div>Story - Time To Split</div><div>Normal | Single player | In game</div><div class="time">01:12:34 transcurrido</div></div></div></div>
+    <div class="member"><div class="avatar"></div><div><div class="who">Manu</div><div class="sub"><div class="tiny full"></div>Jugando a TimeSplitters</div></div></div>
+  </div>
+
+  <div class="option">
+    <div class="label">B. Logo arriba <span>(recorte superior)</span></div>
+    <div class="card"><div class="head">JUGANDO</div><div class="row"><div class="big logo"></div>
+      <div class="text"><div class="name">TimeSplitters: Future Perfect</div><div>Story - Time To Split</div><div>Normal | Single player | In game</div><div class="time">01:12:34 transcurrido</div></div></div></div>
+    <div class="member"><div class="avatar"></div><div><div class="who">Manu</div><div class="sub"><div class="tiny logo"></div>Jugando a TimeSplitters</div></div></div>
+  </div>
+
+  <div class="option">
+    <div class="label">C. Cortez y el portal <span>(recorte medio)</span></div>
+    <div class="card"><div class="head">JUGANDO</div><div class="row"><div class="big mid"></div>
+      <div class="text"><div class="name">TimeSplitters: Future Perfect</div><div>Story - Time To Split</div><div>Normal | Single player | In game</div><div class="time">01:12:34 transcurrido</div></div></div></div>
+    <div class="member"><div class="avatar"></div><div><div class="who">Manu</div><div class="sub"><div class="tiny mid"></div>Jugando a TimeSplitters</div></div></div>
+  </div>
+
+  <div class="option">
+    <div class="label">D. Cara de Cortez <span>(primer plano)</span></div>
+    <div class="card"><div class="head">JUGANDO</div><div class="row"><div class="big face"></div>
+      <div class="text"><div class="name">TimeSplitters: Future Perfect</div><div>Story - Time To Split</div><div>Normal | Single player | In game</div><div class="time">01:12:34 transcurrido</div></div></div></div>
+    <div class="member"><div class="avatar"></div><div><div class="who">Manu</div><div class="sub"><div class="tiny face"></div>Jugando a TimeSplitters</div></div></div>
+  </div>
+
+</div>
+</body>
+</html>
