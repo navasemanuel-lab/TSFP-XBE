@@ -193,6 +193,7 @@ void ReadTextures() {
     std::set<std::string> names;
     for (uint32_t s = kFirstSprite; s <= kLastSprite; s++) names.insert(kTs2Folder + SpriteName(s) + ".xbt");
     names.insert(kTs2Folder + SpriteName(kCircle) + ".xbt");
+    names.insert(kTs2Folder + SpriteName(kHudBack) + ".xbt");
     for (auto& [name, bytes] : game::Ts2Files(names))
         g_textures[name.substr(sizeof kTs2Folder - 1, name.size() - (sizeof kTs2Folder - 1) - 4)] = std::move(bytes);
     LOGR("hud: %zu of TimeSplitters 2's %zu HUD sprites read from %s", g_textures.size(), names.size(),
@@ -237,10 +238,19 @@ const std::vector<uint8_t>* Ts2Sprite(const std::string& path) {
     if (path.size() <= sizeof kGameFolder - 1 + 4 || path.compare(0, sizeof kGameFolder - 1, kGameFolder)) return nullptr;
     auto it = g_textures.find(path.substr(sizeof kGameFolder - 1, path.size() - (sizeof kGameFolder - 1) - 4));
     if (it == g_textures.end()) return nullptr;
+    // the boxes' ground: the final game's own is a pink one, TimeSplitters 2's white (tinted by the box's colour)
+    if (it->first == SpriteName(kHudBack) && Opt().hud_style != 1) return nullptr;
     static std::set<std::string> served;
     if (served.insert(it->first).second)
         LOGR("hud: TimeSplitters 2's %s served (%zu bytes)", it->first.c_str(), it->second.size());
     return &it->second;
+}
+
+// briefing.cpp: the boxes' ground, which the game's paks have too, read in place of theirs in TimeSplitters 2's style
+const std::vector<uint8_t>* Ts2Replacement(const std::string& path) {
+    if (Opt().hud_style != 1 || path != kGameFolder + SpriteName(kHudBack) + ".xbt") return nullptr;
+    ReadTextures();  // it may be loaded before any gun
+    return Ts2Sprite(path);
 }
 
 }  // namespace game

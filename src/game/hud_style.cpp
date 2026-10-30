@@ -380,7 +380,8 @@ namespace {
 constexpr uint32_t kBoxPieces[6] = {0x12E67D, 0x12E6A3, 0x12E6C2, 0x12E6E8, 0x12E714, 0x12E735};  // the last always
 constexpr uint32_t kHudBack = 249, kHudBackTexels = 64 * 16;
 constexpr uint32_t kTs2Blue = 0x3C417F00;  // 0xRRGGBBAA, alpha left out
-constexpr float kRankAbove = 0.5f, kRankAside = 0.1f;  // of the brackets' height and width: the label above them inside
+// of the brackets' height and width: the label above them inside, and as wide as TimeSplitters 2's flat ovals
+constexpr float kRankAbove = 0.5f, kRankAside = 0.7f;
 bool g_rank_box = false, g_grey_box = false;
 constexpr uint32_t kGreyBoxes[2] = {0x12EDC5, 0x14F5CC};  // the box's returns to its clocks
 constexpr uint32_t kTs2Grey = 0x50505000;

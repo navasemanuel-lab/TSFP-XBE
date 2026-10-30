@@ -27,6 +27,7 @@ uint32_t HostThunk(X86Func* fn);  // cpu/dispatch.cpp: a guest address that call
 namespace game {
 void WithTextScale(X86Context& ctx, const std::function<void()>& f, float scale);  // game/menu_layout.cpp
 const std::vector<uint8_t>* Ts2Sprite(const std::string& path);                   // game/hud_ammo.cpp
+const std::vector<uint8_t>* Ts2Replacement(const std::string& path);              // game/hud_ammo.cpp
 const std::vector<uint8_t>* BetaCortezFile(const std::string& path);              // game/beta_cortez.cpp
 const std::vector<uint8_t>* BetaSkylineFile(const std::string& path);             // game/beta_skyline.cpp
 const std::vector<uint8_t>* StoryCharacterFile(std::string path);                 // game/story_characters.cpp
@@ -201,6 +202,10 @@ X86_FUNC(sub_00062CA0) {
         kernel::Return(ctx, uint32_t(p->size()), 0);
         return;
     }
+    if (auto p = game::Ts2Replacement(TexturePath(name))) {
+        kernel::Return(ctx, uint32_t(p->size()), 0);
+        return;
+    }
     __imp__sub_00062CA0(ctx, base);
     if (int32_t(ctx.eax) > 0) return;
     if (auto p = Served(name)) ctx.eax = uint32_t(p->size());
@@ -215,6 +220,12 @@ X86_FUNC(sub_00062D20) {
         uint32_t n = std::min<uint32_t>(uint32_t(p->size()), most);
         std::memcpy(kernel::HostPtr(buffer), p->data(), n);
         game::mods::Read(kernel::ReadCString(name, 256), buffer);
+        kernel::Return(ctx, n, 0);
+        return;
+    }
+    if (auto p = game::Ts2Replacement(TexturePath(name))) {
+        uint32_t n = std::min<uint32_t>(uint32_t(p->size()), most);
+        std::memcpy(kernel::HostPtr(buffer), p->data(), n);
         kernel::Return(ctx, n, 0);
         return;
     }
