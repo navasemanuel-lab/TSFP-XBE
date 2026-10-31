@@ -24,6 +24,8 @@ void SetOn(const std::string& folder, bool on);
 // the file at a path in the paks (as the game names it: "host0:" and the loader's .raw for .xbt allowed) from the
 // first mod switched on that has it; nullptr when none. What it points to stays while the game runs.
 const std::vector<uint8_t>* File(const std::string& path);
+// the paths of the files the mods switched on give, those starting with `prefix`
+std::vector<std::string> Paths(const std::string& prefix);
 
 // A mod's first-person model (a .xbr named *_anim) adjusted as it is served: scaled (length along z, girth across),
 // turned (degrees) and moved about the middle of its box. Kept in the mod's adjust.toml, a table per model name.

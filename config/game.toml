@@ -286,3 +286,105 @@ XPP_MemoryUnitType          = 0x46C6E0
 # argument locations in API order for functions a link time code generated library compiled with another
 # convention: a register (eax ebx ecx edx esi edi ebp) or "stack" for the next stack slot, which the callee pops
 [abi]
+
+# MapMaker maps larger than 32 KB (src/game/mapmaker.cpp): the map's block, the walks of its chunks, the editor's
+# memory full tests and the file save's size, each 0x7FE0 in the image
+[[hook]]
+at = 0x2FE20D
+call = "MapMakerMapBlock"
+[[hook]]
+at = 0x2FE246
+call = "MapMakerMapBlock"
+[[hook]]
+at = 0x85986
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x85A6C
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x8A7C7
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x23F3AE
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x23FD20
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x23FE31
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x2405B5
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x240D4F
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x190A12
+call = "MapMakerEndEax"
+after = true
+[[hook]]
+at = 0x23F764
+call = "MapMakerEndEcx"
+after = true
+[[hook]]
+at = 0x2407FB
+call = "MapMakerEndEcx"
+after = true
+[[hook]]
+at = 0x2423C4
+call = "MapMakerEndEcx"
+after = true
+[[hook]]
+at = 0x8AB2F
+call = "MapMakerEndEdx"
+after = true
+[[hook]]
+at = 0x32A5CA
+call = "MapMakerEndEdi"
+after = true
+[[hook]]
+at = 0x32A6FC
+call = "MapMakerEndEdi"
+after = true
+[[hook]]
+at = 0x1909CA
+call = "MapMakerEndEdi"
+after = true
+[[hook]]
+at = 0x337E1A
+call = "MapMakerEndEbp"
+after = true
+[[hook]]
+at = 0x190A39
+call = "MapMakerEndPushed"
+after = true
+[[hook]]
+at = 0x300696
+call = "MapMakerFullEax"
+[[hook]]
+at = 0x3006AB
+call = "MapMakerFullEax"
+[[hook]]
+at = 0x30366D
+call = "MapMakerFullEax"
+[[hook]]
+at = 0x303936
+call = "MapMakerFullEax"
+[[hook]]
+at = 0x304442
+call = "MapMakerFullEax"
+[[hook]]
+at = 0x31CF17
+call = "MapMakerGhostOption"
+[[hook]]
+at = 0x2422DE
+call = "MapMakerGhostSpawner"

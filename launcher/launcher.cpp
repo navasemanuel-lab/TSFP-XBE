@@ -3,9 +3,9 @@
 // release's update.txt names a GitHub repository (and, for a private one, a read-only token on its second line) whose
 // latest release carries TSFP.zip, its tag the version, which version.txt beside the launcher holds for the installed
 // one. Drawn with Direct2D: the banner is the game's cover when the art folder beside the launcher has it
-// (art/cover.jpg, and art/logo.png for a cover wider than tall: the release's, not part of this source), else a time
-// portal made here.
-//   --snapshot <file.png> [missing|ready|importing]   draws one frame into a picture and quits
+// (art/cover.jpg, and art/logo.png for a cover wider than tall: the release's, not part of this source), then the
+// pictures of art/slides in their names' order, one fading into the next; else a time portal made here.
+//   --snapshot <file.png> [missing|ready|importing|settings|mods|saves|levels] [seconds]   draws one frame into a picture and quits
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -28,8 +28,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -449,6 +453,7 @@ struct Gfx {
     ComPtr<ID2D1SolidColorBrush> brush;
     ComPtr<ID2D1Bitmap> swirl, swirl_fine, icon;
     ComPtr<ID2D1Bitmap> cover, logo;  // art/cover.jpg and art/logo.png, when there
+    std::vector<ComPtr<ID2D1Bitmap>> slides;  // art/slides, shown after the cover in turn
     ComPtr<ID2D1LinearGradientBrush> cover_fade;
     ComPtr<ID2D1LinearGradientBrush> streak, chrome, sky, shade, play;
     ComPtr<ID2D1RadialGradientBrush> glow, core;
@@ -456,8 +461,21 @@ struct Gfx {
     D2D1_RECT_F title_bounds{};
 };
 
+// the pages under the title: playing (the disc, updates), the settings the game reads at start, the mods, the saves
+enum Page { kPagePlay, kPageSettings, kPageMods, kPageSaves, kPages };
+constexpr const wchar_t* kPageNames[kPages] = {L"PLAY", L"SETTINGS", L"MODS", L"SAVES"};
+constexpr float kShift = 8;  // the play page under the page names
+
+// a place to click a page drew this frame, after the fixed buttons (its id kButtons and on)
+struct Hot {
+    D2D1_RECT_F rect;
+    std::function<void()> press;
+};
+
 struct Ui {
     Button buttons[kButtons];
+    int page = kPagePlay;
+    std::vector<Hot> hot;
     int hover = -1, pressed = -1;
     std::vector<Star> stars;
     std::vector<Streak> streaks;
@@ -521,6 +539,16 @@ void CreateResources(Gfx& g) {
                                   Stops(rt, {{0, Rgb(0xFFFFFF, 1)}, {0.35f, Rgb(0xBFF0FF, 0.7f)}, {1, Rgb(0x52C8FF, 0)}}).Get(), &g.core);
     g.cover = Picture(rt, ExeDir() / "art" / "cover.jpg");
     g.logo = Picture(rt, ExeDir() / "art" / "logo.png");
+    g.slides.clear();
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(ExeDir() / "art" / "slides", ec)) {
+        std::wstring ext = Lower(e.path().extension().wstring());
+        if (ext == L".jpg" || ext == L".jpeg" || ext == L".png" || ext == L".bmp") files.push_back(e.path());
+    }
+    std::sort(files.begin(), files.end());
+    for (const fs::path& f : files)
+        if (ComPtr<ID2D1Bitmap> b = Picture(rt, f)) g.slides.push_back(b);
     rt->CreateLinearGradientBrush({}, Stops(rt, {{0, Rgb(0x05070C, 0)}, {1, Rgb(0x05070C, 1)}}).Get(), &g.cover_fade);
     g.title = TextShape(L"TIMESPLITTERS", L"Palatino Linotype", DWRITE_FONT_WEIGHT_BOLD, 46, 1.5f);
     g.title->GetBounds(nullptr, &g.title_bounds);
@@ -575,8 +603,19 @@ void Simulate(float dt) {
 
 bool Glitching(double t) { return std::fmod(t, 7.0) > 6.75; }
 
+// a picture filling the banner, its middle kept, drifting slowly in (zoom)
+void DrawFilling(Gfx& g, ID2D1Bitmap* b, float zoom, float opacity) {
+    D2D1_SIZE_F size = b->GetSize();
+    float scale = std::max(kBanner / size.width, (kHeight - kBar) / size.height) * zoom;
+    float w = size.width * scale, h = size.height * scale, cy = (kBar + kHeight) / 2;
+    g.rt->DrawBitmap(b, {(kBanner - w) / 2, cy - h / 2, (kBanner + w) / 2, cy + h / 2}, opacity,
+                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+}
+
 // the cover filling the banner, drifting slowly in as the game's own menus do; a cover wider than tall goes across the
-// top, fading into the dark, with the logo (art/logo.png) under it
+// top, fading into the dark, with the logo (art/logo.png) under it. With slides, the cover and each slide shown
+// kSlide seconds in turn, the last kFade of them fading into the next, each drifting in from its start
+constexpr double kSlide = 9, kFade = 1.6;
 void DrawCover(Gfx& g, double t) {
     ID2D1RenderTarget* rt = g.rt.Get();
     D2D1_RECT_F area = {0, kBar, kBanner, kHeight};
@@ -584,11 +623,19 @@ void DrawCover(Gfx& g, double t) {
     Fill(g, area, Rgb(0x05070C));
     D2D1_SIZE_F size = g.cover->GetSize();
     float zoom = 1.03f + 0.02f * std::sin(float(t) * 0.25f);
-    if (size.height >= size.width) {
-        float scale = std::max(kBanner / size.width, (kHeight - kBar) / size.height) * zoom;
-        float w = size.width * scale, h = size.height * scale, cy = (kBar + kHeight) / 2;
-        rt->DrawBitmap(g.cover.Get(), {(kBanner - w) / 2, cy - h / 2, (kBanner + w) / 2, cy + h / 2}, 1,
-                       D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    size_t count = g.slides.size() + 1, at = size_t(t / kSlide) % count;
+    double into = std::fmod(t, kSlide);
+    auto picture = [&](size_t i) { return i ? g.slides[i - 1].Get() : g.cover.Get(); };
+    auto drift = [&](double since) { return 1.02f + 0.05f * float(std::min(since, kSlide + kFade) / (kSlide + kFade)); };
+    if (count > 1 && (at || size.height >= size.width)) {
+        // the slide shown, then the next fading in over it
+        DrawFilling(g, picture(at), drift(into + kFade), 1);
+        if (into > kSlide - kFade) {
+            float f = float((into - (kSlide - kFade)) / kFade);
+            DrawFilling(g, picture((at + 1) % count), drift(into - (kSlide - kFade)), f * f * (3 - 2 * f));
+        }
+    } else if (size.height >= size.width) {
+        DrawFilling(g, g.cover.Get(), zoom, 1);
     } else {
         float height = kBanner * size.height / size.width;
         float w = kBanner * zoom, h = height * zoom;
@@ -757,11 +804,11 @@ void DrawBanner(Gfx& g, double t) {
 
 void Layout() {
     float l = kBanner + 42, r = kWidth - 42, mid = (l + r) / 2;
-    g_ui.buttons[kImport] = {{l, 447, mid - 8, 499}, L"IMPORT / REPAIR"};
-    g_ui.buttons[kPlay] = {{mid + 8, 447, r, 499}, L"PLAY", true};
-    g_ui.buttons[kVerify] = {{l, 511, mid - 8, 549}, L"VERIFY FILES"};
-    g_ui.buttons[kFolder] = {{mid + 8, 511, r, 549}, L"OPEN GAME FOLDER"};
-    g_ui.buttons[kUpdate] = {{mid + 8, 593, r, 631}, L"CHECK FOR UPDATES"};
+    g_ui.buttons[kImport] = {{l, 447 + kShift, mid - 8, 499 + kShift}, L"IMPORT / REPAIR"};
+    g_ui.buttons[kPlay] = {{mid + 8, 447 + kShift, r, 499 + kShift}, L"PLAY", true};
+    g_ui.buttons[kVerify] = {{l, 511 + kShift, mid - 8, 549 + kShift}, L"VERIFY FILES"};
+    g_ui.buttons[kFolder] = {{mid + 8, 511 + kShift, r, 549 + kShift}, L"OPEN GAME FOLDER"};
+    g_ui.buttons[kUpdate] = {{mid + 8, 593 + kShift, r, 631 + kShift}, L"CHECK FOR UPDATES"};
     g_ui.buttons[kMinimize] = {{kWidth - 92, 0, kWidth - 46, kBar}, L""};
     g_ui.buttons[kClose] = {{kWidth - 46, 0, kWidth, kBar}, L""};
 }
@@ -777,15 +824,12 @@ bool Enabled(int id, const Status& s) {
     }
 }
 
-void DrawPage(Gfx& g, const Status& s) {
+void DrawPlay(Gfx& g, const Status& s) {
     ID2D1RenderTarget* rt = g.rt.Get();
     float l = kBanner + 42, r = kWidth - 42;
-    Fill(g, {kBanner, kBar, kWidth, kHeight}, kBack);
-
-    Text(g, L"TIMESPLITTERS", g_fonts.heading.Get(), {l, 52, r, 96}, kText, DWRITE_TEXT_ALIGNMENT_LEADING, 1);
-    Text(g, L"FUTURE PERFECT  \x00B7  RECOMPILED", g_fonts.label.Get(), {l + 2, 99, r, 118}, kCyan, DWRITE_TEXT_ALIGNMENT_LEADING, 3);
-    if (g.icon) rt->DrawBitmap(g.icon.Get(), {r - 62, 50, r, 112}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-    Fill(g, {l, 134, r, 135}, kLine);
+    D2D1_MATRIX_3X2_F was;
+    rt->GetTransform(&was);
+    rt->SetTransform(D2D1::Matrix3x2F::Translation(0, kShift) * was);
 
     std::wstring heading, body;
     switch (s.busy && s.progress >= 0 ? Found::Checking : s.check.found) {
@@ -853,6 +897,7 @@ void DrawPage(Gfx& g, const Status& s) {
         Fill(g, {l, 428, r, 432}, Rgb(0x52C8FF, 0.75f));
     }
 
+    rt->SetTransform(was);
     for (int id = 0; id < kMinimize; id++) {
         const Button& b = g_ui.buttons[id];
         bool on = Enabled(id, s), hover = on && g_ui.hover == id, down = hover && g_ui.pressed == id;
@@ -875,6 +920,7 @@ void DrawPage(Gfx& g, const Status& s) {
     }
 
     // the updates
+    rt->SetTransform(D2D1::Matrix3x2F::Translation(0, kShift) * was);
     float mid = (l + r) / 2;
     Text(g, L"UPDATES", g_fonts.label.Get(), {l, 567, r, 585}, kCyan, DWRITE_TEXT_ALIGNMENT_LEADING, 1.5f);
     std::wstring installed = L"Installed: " + (s.version.empty() ? std::wstring(L"unknown") : s.version);
@@ -899,6 +945,584 @@ void DrawPage(Gfx& g, const Status& s) {
 
     Text(g, std::wstring(L"TSFP RECOMP   /   ") + kVersion, g_fonts.note.Get(), {l, 670, r, 688}, Rgb(0x4A5060),
          DWRITE_TEXT_ALIGNMENT_LEADING, 1.5f);
+    rt->SetTransform(was);
+}
+
+// ---- the settings, mods and saves pages ---------------------------------------------------------------------------
+
+// settings.toml beside the game: its lines kept as they are, a top level `key = value` read or changed in place (the
+// game writes it whole when it saves; what is changed here applies the next time it starts)
+fs::path SettingsFile() { return ExeDir() / L"settings.toml"; }
+std::vector<std::string> SettingsLines() {
+    std::vector<std::string> lines;
+    std::ifstream in(SettingsFile());
+    for (std::string line; std::getline(in, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    return lines;
+}
+std::string Trim(std::string v) {
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+    return v;
+}
+// a top level key's value, its quotes taken off; def when it is not there
+std::string Setting(const std::string& key, const std::string& def) {
+    for (const std::string& line : SettingsLines()) {
+        if (!line.empty() && line[0] == '[') break;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos || Trim(line.substr(0, eq)) != key) continue;
+        std::string v = Trim(line.substr(eq + 1));
+        if (v.size() >= 2 && (v[0] == '\'' || v[0] == '"')) v = v.substr(1, v.size() - 2);
+        return v;
+    }
+    return def;
+}
+// a top level key set: a value as TOML writes it (a number, true or false, or a quoted string)
+void SetSetting(const std::string& key, const std::string& toml) {
+    std::vector<std::string> lines = SettingsLines();
+    size_t at = lines.size();
+    bool done = false;
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (!lines[i].empty() && lines[i][0] == '[') {
+            at = i;
+            break;
+        }
+        size_t eq = lines[i].find('=');
+        if (eq != std::string::npos && Trim(lines[i].substr(0, eq)) == key) {
+            lines[i] = key + " = " + toml;
+            done = true;
+            break;
+        }
+    }
+    if (!done) lines.insert(lines.begin() + at, key + " = " + toml);
+    std::ofstream out(SettingsFile(), std::ios::binary | std::ios::trunc);
+    for (const std::string& line : lines) out << line << "\n";
+}
+std::string Quoted(const std::string& v) { return "'" + v + "'"; }
+int SettingInt(const std::string& key, int def) {
+    std::string v = Setting(key, "");
+    return v.empty() ? def : std::atoi(v.c_str());
+}
+bool SettingBool(const std::string& key, bool def) {
+    std::string v = Setting(key, "");
+    return v.empty() ? def : v == "true";
+}
+std::wstring Wide(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    std::wstring w(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+    return w;
+}
+
+// a setting the page shows: its choices' names, which one is set, and setting one
+struct Option {
+    const wchar_t* label;
+    std::vector<std::wstring> names;
+    std::function<int()> get;
+    std::function<void(int)> set;
+};
+
+// the graphics presets, as the game's own settings panel has them: render scale, MSAA, texture sharpness, edge
+// smoothing, ambient occlusion
+struct Preset {
+    const wchar_t* name;
+    int render, msaa, aniso, edge, ao;
+};
+constexpr Preset kPresets[] = {{L"Original", 100, 0, 0, 0, 0}, {L"Light", 100, 0, 4, 1, 0}, {L"Balanced", 100, 2, 8, 2, 1},
+                               {L"High", 100, 4, 16, 2, 2},     {L"Ultra", 150, 4, 16, 2, 2}};
+
+// a choice of strings saved as they are named in the file
+Option Strings(const wchar_t* label, const char* key, std::vector<std::wstring> names, std::vector<std::string> values,
+               const std::string& def) {
+    return {label, std::move(names),
+            [key, values, def] {
+                std::string v = Setting(key, def);
+                for (size_t i = 0; i < values.size(); i++)
+                    if (values[i] == v) return int(i);
+                return 0;
+            },
+            [key, values](int i) { SetSetting(key, Quoted(values[size_t(i)])); }};
+}
+Option Switch(const wchar_t* label, const char* key, bool def) {
+    return {label, {L"Off", L"On"}, [key, def] { return SettingBool(key, def) ? 1 : 0; },
+            [key](int i) { SetSetting(key, i ? "true" : "false"); }};
+}
+// a number among values, the nearest one shown as set
+Option Numbers(const wchar_t* label, const char* key, std::vector<int> values, int def, const wchar_t* unit) {
+    std::vector<std::wstring> names;
+    for (int v : values) names.push_back(std::to_wstring(v) + unit);
+    return {label, std::move(names),
+            [key, values, def] {
+                int v = SettingInt(key, def), best = 0;
+                for (size_t i = 0; i < values.size(); i++)
+                    if (std::abs(values[i] - v) < std::abs(values[size_t(best)] - v)) best = int(i);
+                return best;
+            },
+            [key, values](int i) { SetSetting(key, std::to_string(values[size_t(i)])); }};
+}
+
+std::vector<Option> MakeOptions() {
+    std::vector<Option> o;
+    o.push_back(Strings(L"Display mode", "display_mode", {L"Fullscreen", L"Borderless", L"Windowed"},
+                        {"fullscreen", "borderless", "windowed"}, "borderless"));
+    // the monitor's modes, largest first
+    std::vector<std::pair<int, int>> modes;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsW(nullptr, i, &dm); i++)
+        if (dm.dmPelsWidth >= 640 && dm.dmPelsHeight >= 480) modes.push_back({int(dm.dmPelsWidth), int(dm.dmPelsHeight)});
+    std::sort(modes.begin(), modes.end(), [](auto a, auto b) { return a.first * a.second > b.first * b.second; });
+    modes.erase(std::unique(modes.begin(), modes.end()), modes.end());
+    std::vector<std::wstring> names;
+    for (auto [w, h] : modes) names.push_back(std::to_wstring(w) + L" x " + std::to_wstring(h));
+    o.push_back({L"Resolution", names,
+                 [modes] {
+                     int w = SettingInt("width", 0), h = SettingInt("height", 0);
+                     for (size_t i = 0; i < modes.size(); i++)
+                         if (modes[i].first == w && modes[i].second == h) return int(i);
+                     return 0;
+                 },
+                 [modes](int i) {
+                     SetSetting("width", std::to_string(modes[size_t(i)].first));
+                     SetSetting("height", std::to_string(modes[size_t(i)].second));
+                 }});
+    std::vector<std::wstring> presets;
+    for (const Preset& p : kPresets) presets.push_back(p.name);
+    presets.push_back(L"Custom");
+    o.push_back({L"Graphics preset", presets,
+                 [] {
+                     for (size_t i = 0; i < std::size(kPresets); i++) {
+                         const Preset& p = kPresets[i];
+                         if (SettingInt("render_percent", 100) == p.render && SettingInt("msaa", 0) == p.msaa &&
+                             SettingInt("anisotropic_filtering", 0) == p.aniso &&
+                             std::min(SettingInt("edge_smoothing", 0), 2) == p.edge &&
+                             std::min(SettingInt("ambient_occlusion", 0), 2) == p.ao)
+                             return int(i);
+                     }
+                     return int(std::size(kPresets));
+                 },
+                 [](int i) {
+                     if (i >= int(std::size(kPresets))) return;
+                     const Preset& p = kPresets[i];
+                     SetSetting("render_percent", std::to_string(p.render));
+                     SetSetting("msaa", std::to_string(p.msaa));
+                     SetSetting("anisotropic_filtering", std::to_string(p.aniso));
+                     SetSetting("edge_smoothing", std::to_string(p.edge));
+                     SetSetting("ambient_occlusion", std::to_string(p.ao));
+                 }});
+    o.push_back(Numbers(L"Render scale", "render_percent", {50, 67, 75, 85, 100, 125, 150, 175, 200}, 100, L"%"));
+    o.push_back(Strings(L"Aspect ratio", "aspect_ratio", {L"Auto", L"4:3", L"16:9", L"16:10", L"21:9", L"32:9"},
+                        {"auto", "4:3", "16:9", "16:10", "21:9", "32:9"}, "auto"));
+    o.push_back(Numbers(L"Field of view", "fov", {40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100}, 55, L"\x00B0"));
+    o.push_back(Switch(L"Vertical sync", "vsync", true));
+    o.push_back(Switch(L"HDR", "hdr", false));
+    o.push_back({L"HUD style", {L"Future Perfect", L"TimeSplitters 2", L"TimeSplitters 1"},
+                 [] { return std::clamp(SettingInt("hud_style", 0), 0, 2); },
+                 [](int i) { SetSetting("hud_style", std::to_string(i)); }});
+    o.push_back(Strings(L"Language", "language", {L"English", L"Fran\x00E7" L"ais", L"Deutsch", L"Espa\x00F1ol", L"Italiano"},
+                        {"english", "french", "german", "spanish", "italian"}, "english"));
+    o.push_back(Switch(L"Skip intro videos", "skip_intros", false));
+    o.push_back(Switch(L"Fast loading", "fast_loading", false));
+    return o;
+}
+
+// a box with arrows either side of what is set; a click on either side steps through the choices
+void DrawOption(Gfx& g, const Option& o, float y, float l, float r) {
+    ID2D1RenderTarget* rt = g.rt.Get();
+    int at = std::clamp(o.get(), 0, int(o.names.size()) - 1), n = int(o.names.size());
+    Text(g, o.label, g_fonts.body.Get(), {l, y, r, y + 30}, kText, DWRITE_TEXT_ALIGNMENT_LEADING, 0,
+         DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    D2D1_RECT_F box = {r - 250, y + 2, r, y + 28};
+    Fill(g, box, kBox);
+    g.brush->SetColor(kLine);
+    rt->DrawRectangle(box, g.brush.Get(), 1);
+    Text(g, o.names[size_t(at)], g_fonts.body.Get(), box, kText, DWRITE_TEXT_ALIGNMENT_CENTER, 0,
+         DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    for (int side = 0; side < 2; side++) {
+        D2D1_RECT_F a = side ? D2D1_RECT_F{box.right - 30, box.top, box.right, box.bottom}
+                             : D2D1_RECT_F{box.left, box.top, box.left + 30, box.bottom};
+        int id = kButtons + int(g_ui.hot.size());
+        bool hover = g_ui.hover == id;
+        if (hover) Fill(g, a, Rgb(0x232A37));
+        Text(g, side ? L"\x203A" : L"\x2039", g_fonts.play.Get(), a, hover ? kCyan : kDim, DWRITE_TEXT_ALIGNMENT_CENTER, 0,
+             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        auto set = o.set;
+        int next = (at + (side ? 1 : n - 1)) % n;
+        g_ui.hot.push_back({a, [set, next] { set(next); }});
+    }
+    Fill(g, {l, y + 33, r, y + 34}, Rgb(0x1A1F29));
+}
+
+// a flat button the pages draw (their own click places)
+void DrawFlat(Gfx& g, D2D1_RECT_F b, const wchar_t* text, std::function<void()> press) {
+    int id = kButtons + int(g_ui.hot.size());
+    bool hover = g_ui.hover == id;
+    Fill(g, b, hover ? Rgb(0x232A37) : kButton);
+    g.brush->SetColor(hover ? Rgb(0x52C8FF, 0.8f) : Rgb(0x343B49));
+    g.rt->DrawRectangle(b, g.brush.Get(), 1);
+    Text(g, text, g_fonts.button.Get(), b, kText, DWRITE_TEXT_ALIGNMENT_CENTER, 1, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    g_ui.hot.push_back({b, std::move(press)});
+}
+
+void DrawSettings(Gfx& g) {
+    static std::vector<Option> options = MakeOptions();
+    float l = kBanner + 42, r = kWidth - 42, y = 160;
+    Text(g, L"Read by the game when it starts. Everything else is in its own settings panel: F1 in the game.",
+         g_fonts.note.Get(), {l, y, r, y + 18}, kDim);
+    y += 28;
+    for (const Option& o : options) {
+        DrawOption(g, o, y, l, r);
+        y += 38;
+    }
+}
+
+// mods/<folder> with its mod.toml (name, description); off when the setting mods_off lists the folder
+struct ModInfo {
+    std::string folder;
+    std::wstring name, about;
+};
+std::vector<ModInfo> Mods() {
+    std::vector<ModInfo> out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(ExeDir() / L"mods", ec)) {
+        if (!e.is_directory()) continue;
+        ModInfo m{e.path().filename().string(), e.path().filename().wstring(), L""};
+        std::ifstream in(e.path() / L"mod.toml");
+        for (std::string line; std::getline(in, line);) {
+            size_t eq = line.find('='), open = line.find('"', eq + 1), close = line.rfind('"');
+            if (eq == std::string::npos || open == std::string::npos || close <= open) continue;
+            std::string key = Trim(line.substr(0, eq)), v = line.substr(open + 1, close - open - 1);
+            if (key == "name") m.name = Wide(v);
+            if (key == "description") m.about = Wide(v);
+        }
+        out.push_back(std::move(m));
+    }
+    return out;
+}
+bool ModOff(const std::string& folder) {
+    std::string off = "," + Setting("mods_off", "") + ",";
+    return off.find("," + folder + ",") != std::string::npos;
+}
+void SetModOn(const std::string& folder, bool on) {
+    std::vector<std::string> list;
+    std::string off = Setting("mods_off", "");
+    for (size_t start = 0; start <= off.size();) {
+        size_t comma = std::min(off.find(',', start), off.size());
+        std::string f = off.substr(start, comma - start);
+        if (!f.empty() && f != folder) list.push_back(f);
+        start = comma + 1;
+    }
+    if (!on) list.push_back(folder);
+    std::sort(list.begin(), list.end());
+    std::string joined;
+    for (const std::string& f : list) joined += (joined.empty() ? "" : ",") + f;
+    SetSetting("mods_off", Quoted(joined));
+}
+
+void DrawMods(Gfx& g) {
+    ID2D1RenderTarget* rt = g.rt.Get();
+    float l = kBanner + 42, r = kWidth - 42, y = 160;
+    Text(g, L"Each folder in mods replaces or adds game files. Switched here or in the game (F1, Mods).",
+         g_fonts.note.Get(), {l, y, r, y + 18}, kDim);
+    y += 30;
+    std::vector<ModInfo> mods = Mods();
+    if (mods.empty()) Text(g, L"No mods yet.", g_fonts.body.Get(), {l, y, r, y + 24}, kDim);
+    for (const ModInfo& m : mods) {
+        bool on = !ModOff(m.folder);
+        Text(g, m.name, g_fonts.body.Get(), {l, y, r - 110, y + 22}, kText);
+        rt->PushAxisAlignedClip({l, y + 23, r - 110, y + 58}, D2D1_ANTIALIAS_MODE_ALIASED);  // two lines at most
+        Text(g, m.about, g_fonts.note.Get(), {l, y + 23, r - 110, y + 80}, kDim);
+        rt->PopAxisAlignedClip();
+        D2D1_RECT_F sw = {r - 86, y + 6, r, y + 34};
+        int id = kButtons + int(g_ui.hot.size());
+        bool hover = g_ui.hover == id;
+        Fill(g, sw, on ? Rgb(0x1E5E8C) : kButton);
+        g.brush->SetColor(hover ? kCyan : Rgb(0x343B49));
+        rt->DrawRectangle(sw, g.brush.Get(), 1);
+        Text(g, on ? L"ON" : L"OFF", g_fonts.button.Get(), sw, on ? Rgb(0xFFFFFF) : kDim, DWRITE_TEXT_ALIGNMENT_CENTER,
+             1, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        std::string folder = m.folder;
+        g_ui.hot.push_back({sw, [folder, on] { SetModOn(folder, !on); }});
+        Fill(g, {l, y + 62, r, y + 63}, Rgb(0x1A1F29));
+        y += 70;
+        if (y > kHeight - 120) break;
+    }
+    DrawFlat(g, {l, kHeight - 70, l + 260, kHeight - 32}, L"OPEN MODS FOLDER", [] {
+        std::error_code ec;
+        fs::create_directories(ExeDir() / L"mods", ec);
+        ShellExecuteW(g_window, L"open", (ExeDir() / L"mods").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    });
+}
+
+// the saves: hdd/E/UDATA/<title>/<save> with its SaveMeta.xbx (UTF-16 "Name=..." lines). A profile's folder has its
+// tsftrpft, a MapMaker level's its .mkr
+fs::path SavesFolder() { return ExeDir() / L"hdd" / L"E" / L"UDATA"; }
+enum SaveKind { kProfiles, kLevels, kKinds };
+struct SaveInfo {
+    std::wstring name, when;
+    fs::path folder;
+};
+std::vector<SaveInfo> Saves(SaveKind kind) {
+    std::vector<SaveInfo> out;
+    std::error_code ec;
+    for (const auto& title : fs::directory_iterator(SavesFolder(), ec))
+        for (const auto& save : fs::directory_iterator(title.path(), ec)) {
+            std::vector<uint8_t> meta;
+            if (!ReadFile(save.path() / L"SaveMeta.xbx", meta) || meta.size() < 4) continue;
+            bool level = false;
+            for (const auto& f : fs::directory_iterator(save.path(), ec))
+                if (Lower(f.path().extension().wstring()) == L".mkr") level = true;
+            if (level != (kind == kLevels)) continue;
+            std::wstring text(reinterpret_cast<const wchar_t*>(meta.data()), meta.size() / 2);
+            size_t at = text.find(L"Name=");
+            std::wstring name = at == std::wstring::npos ? save.path().filename().wstring() : text.substr(at + 5);
+            name = name.substr(0, name.find_first_of(L"\r\n"));
+            if (level && name.rfind(L"MapMaker: ", 0) == 0) name = name.substr(10);
+            auto t = fs::last_write_time(save.path() / L"SaveMeta.xbx", ec);
+            auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
+            std::time_t tt = std::chrono::system_clock::to_time_t(sys);
+            std::tm tm{};
+            localtime_s(&tm, &tt);
+            wchar_t when[32];
+            wcsftime(when, 32, L"%Y-%m-%d %H:%M", &tm);
+            out.push_back({name, when, save.path()});
+        }
+    std::sort(out.begin(), out.end(), [](const SaveInfo& a, const SaveInfo& b) { return a.when > b.when; });
+    return out;
+}
+
+std::wstring g_saves_note;
+bool g_saves_error = false;
+int g_saves_kind = kProfiles;
+float g_saves_scroll = 0;  // rows scrolled past, by the mouse wheel
+
+std::wstring Stamp() {
+    std::time_t tt = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &tt);
+    wchar_t stamp[32];
+    wcsftime(stamp, 32, L"%Y-%m-%d_%H%M%S", &tm);
+    return stamp;
+}
+
+// the saves copied whole to saves_backup/<date and time>
+void BackUpSaves() {
+    std::error_code ec;
+    fs::path to = ExeDir() / L"saves_backup" / Stamp();
+    fs::create_directories(to, ec);
+    fs::copy(ExeDir() / L"hdd" / L"E", to / L"E", fs::copy_options::recursive, ec);
+    g_saves_error = bool(ec);
+    g_saves_note = ec ? L"The backup failed: " + Wide(ec.message()) : L"All saves copied to saves_backup\\" + to.filename().wstring();
+}
+
+// one save copied to saves_backup/exported/<its folder>, to share or keep, and that folder shown
+void ExportSave(const SaveInfo& save) {
+    std::error_code ec;
+    fs::path to = ExeDir() / L"saves_backup" / L"exported" / save.folder.filename();
+    fs::remove_all(to, ec);
+    fs::create_directories(to, ec);
+    fs::copy(save.folder, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    g_saves_error = bool(ec);
+    g_saves_note = ec ? L"The export failed: " + Wide(ec.message()) : L"\"" + save.name + L"\" exported to saves_backup\\exported";
+    if (!ec) ShellExecuteW(g_window, L"open", to.parent_path().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// one save to the Recycle Bin, after asking (it can be put back from there)
+void DeleteSave(const SaveInfo& save) {
+    std::wstring ask = L"Move \"" + save.name + L"\" to the Recycle Bin?\n\nIt can be restored from there.";
+    if (MessageBoxW(g_window, ask.c_str(), L"Delete save", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    std::wstring from = save.folder.wstring();
+    from.push_back(L'\0');  // a list of paths, ended by an empty one
+    SHFILEOPSTRUCTW op{};
+    op.hwnd = g_window;
+    op.wFunc = FO_DELETE;
+    op.pFrom = from.c_str();
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT;
+    bool ok = SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+    g_saves_error = !ok;
+    g_saves_note = ok ? L"\"" + save.name + L"\" moved to the Recycle Bin." : L"It could not be deleted.";
+}
+
+// A save's data files (a profile's tsftrpft, a level's .mkr) end with a 20-byte HMAC-SHA1 of the rest. An Xbox or
+// xemu keys it with the console's keys; the port's are all zero, so a save from there reads as damaged until its
+// signature is worked out again with those. Returns the files re-signed, -1 when one could not be written
+int Resign(const fs::path& save) {
+    int count = 0;
+    std::error_code ec;
+    for (const auto& f : fs::directory_iterator(save, ec)) {
+        std::wstring ext = Lower(f.path().extension().wstring());
+        if (ext != L".mkr" && Lower(f.path().filename().wstring()) != L"tsftrpft") continue;
+        std::vector<uint8_t> data;
+        if (!ReadFile(f.path(), data) || data.size() <= 20) continue;
+        uint8_t key[16] = {}, sig[20] = {};
+        BCryptHash(BCRYPT_HMAC_SHA1_ALG_HANDLE, key, sizeof(key), data.data(), ULONG(data.size() - 20), sig, 20);
+        if (!std::memcmp(sig, data.data() + data.size() - 20, 20)) continue;
+        std::memcpy(data.data() + data.size() - 20, sig, 20);
+        std::ofstream out(f.path(), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+        if (!out) return -1;
+        count++;
+    }
+    return count;
+}
+
+// a save folder (with its SaveMeta.xbx, as exported, or from an Xbox or xemu), or a folder of them, copied in beside
+// the others and re-signed for the port
+void ImportSave() {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return;
+    DWORD flags = 0;
+    dialog->GetOptions(&flags);
+    dialog->SetOptions(flags | FOS_PICKFOLDERS);
+    dialog->SetTitle(L"A save's folder (the one with its SaveMeta.xbx), or a folder of saves");
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (FAILED(dialog->Show(g_window)) || FAILED(dialog->GetResult(&item)) ||
+        FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+        return;
+    fs::path from = path;
+    CoTaskMemFree(path);
+    std::error_code ec;
+    std::vector<fs::path> saves;
+    if (fs::exists(from / L"SaveMeta.xbx", ec)) saves.push_back(from);
+    else
+        for (const auto& d : fs::directory_iterator(from, ec))
+            if (fs::exists(d.path() / L"SaveMeta.xbx", ec)) saves.push_back(d.path());
+    if (saves.empty()) {
+        g_saves_error = true;
+        g_saves_note = L"No save there: a save's folder has its SaveMeta.xbx.";
+        return;
+    }
+    // beside the game's other saves, under its title's folder
+    fs::path title = SavesFolder() / L"45410066";
+    for (const auto& t : fs::directory_iterator(SavesFolder(), ec)) title = t.path();
+    int added = 0, there = 0, resigned = 0, failed = 0;
+    for (const fs::path& save : saves) {
+        fs::path to = title / save.filename();
+        if (fs::exists(to, ec)) {
+            there++;
+            continue;
+        }
+        fs::create_directories(to, ec);
+        fs::copy(save, to, fs::copy_options::recursive, ec);
+        int n = ec ? -1 : Resign(to);
+        if (n < 0) {
+            failed++;
+            fs::remove_all(to, ec);
+            continue;
+        }
+        added++;
+        resigned += n > 0;
+    }
+    g_saves_error = failed || !added;
+    g_saves_note = std::to_wstring(added) + (added == 1 ? L" save imported" : L" saves imported");
+    if (resigned) g_saves_note += L", " + std::to_wstring(resigned) + L" from an Xbox re-signed";
+    if (there) g_saves_note += L", " + std::to_wstring(there) + L" already there (delete to replace)";
+    if (failed) g_saves_note += L", " + std::to_wstring(failed) + L" could not be copied";
+    g_saves_note += L".";
+}
+
+void DrawSaves(Gfx& g) {
+    ID2D1RenderTarget* rt = g.rt.Get();
+    float l = kBanner + 42, r = kWidth - 42, y = 158;
+    // profiles or MapMaker levels
+    std::vector<SaveInfo> lists[kKinds] = {Saves(kProfiles), Saves(kLevels)};
+    const wchar_t* kinds[kKinds] = {L"PROFILES", L"MAPMAKER LEVELS"};
+    float x = l;
+    for (int k = 0; k < kKinds; k++) {
+        std::wstring label = std::wstring(kinds[k]) + L"  " + std::to_wstring(lists[k].size());
+        float w = k ? 190.f : 130.f;
+        D2D1_RECT_F b = {x, y, x + w, y + 28};
+        int id = kButtons + int(g_ui.hot.size());
+        bool on = g_saves_kind == k, hover = g_ui.hover == id;
+        Fill(g, b, on ? Rgb(0x1E5E8C) : hover ? Rgb(0x232A37) : kButton);
+        g.brush->SetColor(on ? kCyan : Rgb(0x343B49));
+        rt->DrawRectangle(b, g.brush.Get(), 1);
+        Text(g, label, g_fonts.label.Get(), b, on ? Rgb(0xFFFFFF) : kText, DWRITE_TEXT_ALIGNMENT_CENTER, 1.5f,
+             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_ui.hot.push_back({b, [k] { g_saves_kind = k, g_saves_scroll = 0; }});
+        x += w + 10;
+    }
+    y += 40;
+
+    // the rows, scrolled by the wheel
+    const std::vector<SaveInfo>& saves = lists[g_saves_kind];
+    const float row = 34, top = y, bottom = kHeight - 104;
+    int fit = int((bottom - top) / row), most = std::max(0, int(saves.size()) - fit);
+    g_saves_scroll = std::clamp(g_saves_scroll, 0.f, float(most));
+    int first = int(g_saves_scroll);
+    if (saves.empty())
+        Text(g, g_saves_kind == kLevels ? L"No MapMaker levels saved yet." : L"No profiles yet.", g_fonts.body.Get(),
+             {l, y, r, y + 24}, kDim);
+    for (int i = first; i < int(saves.size()) && i < first + fit; i++) {
+        const SaveInfo& sv = saves[size_t(i)];
+        Text(g, sv.name, g_fonts.body.Get(), {l, y + 4, r - 300, y + 28}, kText);
+        Text(g, sv.when, g_fonts.note.Get(), {r - 300, y + 8, r - 170, y + 28}, kDim);
+        for (int a = 0; a < 2; a++) {
+            D2D1_RECT_F b = {r - 160 + a * 82.f, y + 4, r - 82 + a * 82.f, y + 28};
+            int id = kButtons + int(g_ui.hot.size());
+            bool hover = g_ui.hover == id;
+            Fill(g, b, hover ? (a ? Rgb(0x5A1E1A) : Rgb(0x232A37)) : kButton);
+            g.brush->SetColor(hover ? (a ? kRed : kCyan) : Rgb(0x343B49));
+            rt->DrawRectangle(b, g.brush.Get(), 1);
+            Text(g, a ? L"DELETE" : L"EXPORT", g_fonts.label.Get(), b, a && hover ? kRed : kText,
+                 DWRITE_TEXT_ALIGNMENT_CENTER, 1, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            SaveInfo copy = sv;
+            g_ui.hot.push_back({b, [copy, a] { a ? DeleteSave(copy) : ExportSave(copy); }});
+        }
+        Fill(g, {l, y + row - 2, r, y + row - 1}, Rgb(0x1A1F29));
+        y += row;
+    }
+    if (most > 0) {  // where the list is: a thin bar at the right
+        float h = bottom - top, bar = std::max(24.f, h * float(fit) / float(saves.size()));
+        float at = top + (h - bar) * (g_saves_scroll / float(most));
+        Fill(g, {r + 10, top, r + 13, bottom}, Rgb(0x1A1F29));
+        Fill(g, {r + 10, at, r + 13, at + bar}, Rgb(0x52C8FF, 0.6f));
+    }
+
+    if (!g_saves_note.empty())
+        Text(g, g_saves_note, g_fonts.note.Get(), {l, kHeight - 96, r, kHeight - 78}, g_saves_error ? kRed : kCyan);
+    float third = (r - l - 16) / 3;
+    DrawFlat(g, {l, kHeight - 70, l + third, kHeight - 32}, L"BACK UP ALL", BackUpSaves);
+    DrawFlat(g, {l + third + 8, kHeight - 70, l + 2 * third + 8, kHeight - 32}, L"IMPORT", ImportSave);
+    DrawFlat(g, {r - third, kHeight - 70, r, kHeight - 32}, L"OPEN FOLDER", [] {
+        std::error_code ec;
+        fs::create_directories(SavesFolder(), ec);
+        ShellExecuteW(g_window, L"open", SavesFolder().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    });
+}
+
+// the right side: the title, the page names, the page shown
+void DrawPage(Gfx& g, const Status& s) {
+    ID2D1RenderTarget* rt = g.rt.Get();
+    float l = kBanner + 42, r = kWidth - 42;
+    Fill(g, {kBanner, kBar, kWidth, kHeight}, kBack);
+    g_ui.hot.clear();
+
+    Text(g, L"TIMESPLITTERS", g_fonts.heading.Get(), {l, 52, r, 96}, kText, DWRITE_TEXT_ALIGNMENT_LEADING, 1);
+    Text(g, L"FUTURE PERFECT  \x00B7  RECOMPILED", g_fonts.label.Get(), {l + 2, 99, r, 118}, kCyan, DWRITE_TEXT_ALIGNMENT_LEADING, 3);
+    if (g.icon) rt->DrawBitmap(g.icon.Get(), {r - 62, 50, r, 112}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    float x = l;
+    for (int i = 0; i < kPages; i++) {
+        float w = i == kPageSettings ? 92.f : 70.f;
+        D2D1_RECT_F tab = {x, 122, x + w, 146};
+        int id = kButtons + int(g_ui.hot.size());
+        bool on = g_ui.page == i, hover = g_ui.hover == id;
+        Text(g, kPageNames[i], g_fonts.label.Get(), tab, on ? kText : hover ? kCyan : kDim, DWRITE_TEXT_ALIGNMENT_LEADING,
+             2, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        if (on) Fill(g, {tab.left, 144, tab.right - 18, 146}, kCyan);
+        g_ui.hot.push_back({tab, [i] { g_ui.page = i; }});
+        x += w + 8;
+    }
+    Fill(g, {l, 146, r, 147}, kLine);
+    switch (g_ui.page) {
+    case kPageSettings: DrawSettings(g); break;
+    case kPageMods: DrawMods(g); break;
+    case kPageSaves: DrawSaves(g); break;
+    default: DrawPlay(g, s); break;
+    }
 }
 
 void DrawBar(Gfx& g) {
@@ -1029,8 +1653,6 @@ std::wstring ReadLine(const fs::path& file, int which = 0) {
 }
 
 std::wstring g_repo, g_token;  // owner/name and, for a private repository, a read-only token: update.txt's two lines
-
-std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 
 // an HTTPS GET into out (or a file, with progress), false on a failure. GitHub's own addresses get the token;
 // redirects are followed here, without it (the files' storage refuses a second credential)
@@ -1247,6 +1869,13 @@ void StartUpdates() {
 }
 
 void Press(int id) {
+    if (id >= kButtons) {
+        if (size_t(id - kButtons) < g_ui.hot.size()) {
+            std::function<void()> press = g_ui.hot[size_t(id - kButtons)].press;
+            press();
+        }
+        return;
+    }
     Status s = GetStatus();
     if (!Enabled(id, s)) return;
     switch (id) {
@@ -1279,9 +1908,13 @@ void Press(int id) {
 
 int HitButton(LPARAM lp) {
     float x = GET_X_LPARAM(lp) / g_scale, y = GET_Y_LPARAM(lp) / g_scale;
-    for (int id = 0; id < kButtons; id++) {
+    for (int id = g_ui.page == kPagePlay ? 0 : kMinimize; id < kButtons; id++) {
         const D2D1_RECT_F& r = g_ui.buttons[id].rect;
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return id;
+    }
+    for (size_t i = 0; i < g_ui.hot.size(); i++) {
+        const D2D1_RECT_F& r = g_ui.hot[i].rect;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return kButtons + int(i);
     }
     return -1;
 }
@@ -1305,8 +1938,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE: g_ui.hover = -1; return 0;
+    case WM_MOUSEWHEEL:
+        if (g_ui.page == kPageSaves) g_saves_scroll -= float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 2;
+        return 0;
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT && g_ui.hover >= 0 && g_ui.hover < kMinimize && Enabled(g_ui.hover, GetStatus())) {
+        if (LOWORD(lp) == HTCLIENT && g_ui.hover >= 0 &&
+            ((g_ui.hover < kMinimize && Enabled(g_ui.hover, GetStatus())) || g_ui.hover >= kButtons)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -1346,7 +1983,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // one frame drawn into a picture, for looking at the design without the window
-int Snapshot(const std::wstring& file, const std::wstring& state) {
+int Snapshot(const std::wstring& file, const std::wstring& state, double time) {
     const float scale = 2;
     ComPtr<IWICBitmap> bitmap;
     g_wic->CreateBitmap(UINT(kWidth * scale), UINT(kHeight * scale), GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bitmap);
@@ -1356,14 +1993,17 @@ int Snapshot(const std::wstring& file, const std::wstring& state) {
         &g_gfx.rt);
     CreateResources(g_gfx);
     Status& s = g_status;
-    if (state == L"ready") s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}};
+    for (int i = 0; i < kPages; i++)
+        if (state == Lower(kPageNames[i])) g_ui.page = i;
+    if (state == L"levels") g_ui.page = kPageSaves, g_saves_kind = kLevels;
+    if (state == L"ready" || g_ui.page != kPagePlay) s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}};
     else if (state == L"importing") s.busy = true, s.progress = 0.42f;
     else if (state == L"glitch") s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}};
     else s.check = {Found::Missing};
     s.version = L"2026.10.29.1415", s.upd = Upd::Available, s.latest = L"2026.10.30.0900";
     g_ui.hover = state == L"ready" ? kPlay : -1;
     for (int i = 0; i < 240; i++) Simulate(1 / 60.f);
-    g_ui.time = state == L"glitch" ? 6.85 : 2.2;
+    g_ui.time = time >= 0 ? time : state == L"glitch" ? 6.85 : 2.2;
     Draw(g_gfx);
 
     ComPtr<IWICStream> stream;
@@ -1396,7 +2036,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc >= 3 && std::wstring(argv[1]) == L"--snapshot") {
         g_snapshot = true;
-        return Snapshot(argv[2], argc >= 4 ? argv[3] : L"missing");
+        return Snapshot(argv[2], argc >= 4 ? argv[3] : L"missing", argc >= 5 ? _wtof(argv[4]) : -1);
     }
 
     // one launcher at a time; after an update the old one is still closing

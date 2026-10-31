@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -36,8 +37,10 @@
 #include "common/mouse.h"
 #include "common/options.h"
 #include "common/panel.h"
+#include "core/diag.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "gpu/backend.h"
 #include "net/lockstep.h"
 #include "xdk/d3d8.h"
 
@@ -56,12 +59,20 @@ namespace panel {
 namespace {
 
 constexpr int kToggleKey = VK_F1;
-constexpr float kFontPx = 48;   // the letters made at this size
-constexpr float kTextPx = 15;   // drawn at this a 1080 line screen, more on a taller one
+constexpr float kFontPx = 48;   // the frame rate's and notices' letters made at this size
+constexpr float kTextPx = 14;   // the panel's text at a 1080 line screen, more on a taller one
+constexpr float kTitle = 1.7f, kHeadingSize = 1.25f;  // the headings' sizes, of the text's
 constexpr int kSlots = 3;       // keys shown for each action
 
+// the look of the game's own menus: deep blue, steel frames, white letters, a light blue selection; headings in
+// Impact, the face of the game's own font (its texture is "impact")
 constexpr ImU32 kAccent = IM_COL32(102, 194, 255, 255);
-constexpr ImU32 kPanelBg = IM_COL32(11, 14, 21, 245);
+constexpr ImU32 kPanelBg = IM_COL32(8, 13, 24, 248);
+constexpr ImU32 kPanelTop = IM_COL32(18, 34, 62, 248);  // the window's ground runs from this at the top
+constexpr ImU32 kSteel = IM_COL32(96, 124, 160, 255);    // frames
+constexpr ImU32 kSteelDim = IM_COL32(52, 70, 96, 255);
+constexpr ImU32 kHeading = IM_COL32(214, 226, 240, 255);
+constexpr ImU32 kSelected = IM_COL32(36, 104, 186, 255);
 
 std::atomic<bool> g_open{false};
 std::atomic<bool> g_hold[4] = {};
@@ -71,6 +82,13 @@ int g_tab = 0;
 int g_force_tab = -1;  // a tab chosen with the shoulder buttons, selected at the next frame
 float g_scale = 1;
 ImFont* g_font = nullptr;
+// the panel's letters made at the size they are drawn at on the screen the game starts on (a font made larger and
+// drawn smaller reads ragged): the text, and in Impact the title and the headings (g_text where Windows lacks it)
+ImFont* g_text = nullptr;
+ImFont* g_mono = nullptr;  // Consolas at the text's size, for the performance overlay's columns
+ImFont* g_title_font = nullptr;
+ImFont* g_heading_font = nullptr;
+float g_text_px = kTextPx;
 ImGuiStyle g_base_style;
 bool g_styled = false;
 std::vector<std::pair<uint32_t, uint32_t>> g_modes;
@@ -128,13 +146,13 @@ void Stage() {
 // the panel's look, its sizes at g_scale
 void Style() {
     ImGuiStyle& st = ImGui::GetStyle();
-    st.WindowRounding = 10;
-    st.ChildRounding = 6;
-    st.FrameRounding = 6;
-    st.GrabRounding = 6;
-    st.TabRounding = 6;
-    st.PopupRounding = 6;
-    st.ScrollbarRounding = 6;
+    st.WindowRounding = 4;
+    st.ChildRounding = 3;
+    st.FrameRounding = 3;
+    st.GrabRounding = 3;
+    st.TabRounding = 3;
+    st.PopupRounding = 3;
+    st.ScrollbarRounding = 3;
     st.WindowPadding = {12, 10};
     st.FramePadding = {8, 4};
     st.CellPadding = {6, 3};
@@ -150,14 +168,15 @@ void Style() {
     const ImVec4 accent(0.40f, 0.76f, 1.0f, 1.0f), dim(0.40f, 0.76f, 1.0f, 0.55f);
     c[ImGuiCol_Text] = ImVec4(0.89f, 0.91f, 0.95f, 1.0f);
     c[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.55f, 0.64f, 1.0f);
-    c[ImGuiCol_WindowBg] = ImGui::ColorConvertU32ToFloat4(kPanelBg);
-    c[ImGuiCol_PopupBg] = ImVec4(0.08f, 0.10f, 0.14f, 0.98f);
-    c[ImGuiCol_Border] = ImVec4(0.17f, 0.20f, 0.27f, 1.0f);
+    c[ImGuiCol_WindowBg] = ImVec4(0, 0, 0, 0);  // the gradient drawn under it (Draw)
+    c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_PopupBg] = ImVec4(0.05f, 0.08f, 0.14f, 0.99f);
+    c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(kSteelDim);
     c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.10f, 0.12f, 0.17f, 1.0f);
-    c[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.17f, 0.23f, 1.0f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.24f, 0.32f, 1.0f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.26f, 0.29f, 0.38f, 1.0f);
-    c[ImGuiCol_Button] = ImVec4(0.17f, 0.20f, 0.27f, 1.0f);
+    c[ImGuiCol_FrameBg] = ImVec4(0.07f, 0.11f, 0.19f, 1.0f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.11f, 0.18f, 0.30f, 1.0f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.14f, 0.24f, 0.40f, 1.0f);
+    c[ImGuiCol_Button] = ImVec4(0.09f, 0.14f, 0.24f, 1.0f);
     c[ImGuiCol_ButtonHovered] = dim;
     c[ImGuiCol_ButtonActive] = accent;
     c[ImGuiCol_CheckMark] = c[ImGuiCol_SliderGrab] = c[ImGuiCol_SliderGrabActive] = accent;
@@ -169,13 +188,41 @@ void Style() {
     c[ImGuiCol_TabSelected] = ImVec4(0.40f, 0.76f, 1.0f, 0.80f);
     c[ImGuiCol_TabSelectedOverline] = accent;
     c[ImGuiCol_TableRowBg] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.03f);
-    c[ImGuiCol_TableBorderLight] = c[ImGuiCol_TableBorderStrong] = ImVec4(0.17f, 0.20f, 0.27f, 1.0f);
+    c[ImGuiCol_TableRowBgAlt] = ImVec4(0.40f, 0.60f, 0.90f, 0.04f);
+    c[ImGuiCol_TableBorderLight] = c[ImGuiCol_TableBorderStrong] = ImGui::ColorConvertU32ToFloat4(kSteelDim);
     c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_ScrollbarGrab] = ImVec4(0.27f, 0.32f, 0.41f, 1.0f);
     c[ImGuiCol_ScrollbarGrabHovered] = c[ImGuiCol_ScrollbarGrabActive] = accent;
     c[ImGuiCol_NavHighlight] = accent;
-    c[ImGuiCol_Separator] = ImVec4(0.17f, 0.20f, 0.27f, 1.0f);
+    c[ImGuiCol_Separator] = ImGui::ColorConvertU32ToFloat4(kSteelDim);
+    st.FrameBorderSize = 1;
+    c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
+}
+
+// a heading in Impact, as large as given (of the text's size), its letters spaced
+void Heading(const char* text, float size = 1.5f) {
+    ImFont* f = size > (kTitle + kHeadingSize) / 2 ? g_title_font : g_heading_font;
+    if (!f) f = g_text;
+    float px = ImGui::GetFontSize() * size;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float x = p.x, spacing = px * 0.06f;
+    for (const char* c = text; *c; c++) {
+        char one[2] = {*c, 0};
+        dl->AddText(f, px, {x + 1, p.y + 1}, IM_COL32(0, 0, 0, 180), one);
+        dl->AddText(f, px, {x, p.y}, kHeading, one);
+        x += f->CalcTextSizeA(px, FLT_MAX, 0, one).x + spacing;
+    }
+    ImGui::Dummy({x - p.x, px});
+}
+
+// a steel rule under a heading: bright at the left, fading out
+void Rule() {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    dl->AddRectFilledMultiColor(p, {p.x + w, p.y + Px(2)}, kSteel, kSteel & 0x00FFFFFF, kSteel & 0x00FFFFFF, kSteel);
+    ImGui::Dummy({w, Px(6)});
 }
 
 // what a line does, in a box by the pointer while it is over the line or the pad's selection is on it
@@ -211,8 +258,8 @@ void Done(const char* help) { Tip(help, g_label_hot); }
 // a tab's lines: two columns, the labels' as wide as they need
 bool BeginLines(const char* id) {
     if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX)) return false;
-    ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-    ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch, 0.54f);
+    ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+    ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch, 0.5f);
     return true;
 }
 void EndLines() { ImGui::EndTable(); }
@@ -322,6 +369,8 @@ void Edit(const char* label, std::string& value, const char* help, bool hidden =
 
 std::string Filtering(uint32_t v) { return v ? std::to_string(v) + "x anisotropic" : "As the game asks"; }
 std::string Multisampling(uint32_t v) { return v ? std::to_string(v) + "x" : "Off"; }
+std::string HdrWhite(uint32_t v) { return v ? std::to_string(v) + " nits" : "Windows'"; }
+std::string HdrPeak(uint32_t v) { return v ? std::to_string(v) + " nits" : "The display's"; }
 
 void DisplayTab() {
     app::Settings& s = app::Get();
@@ -361,11 +410,75 @@ void DisplayTab() {
     }
     Slider("Brightness", s.brightness, 50, 150, 100, "%d%%",
            "Lifts or lowers the darks and middle tones; white and black stay. A right click puts back 100%.");
+    const char* hdr_note = gpu::g_hdr_output == 1 ? "on" : gpu::g_hdr_output == -1 ? "HDR is off in Windows" : nullptr;
+    Switch("HDR", s.hdr,
+           "HDR10 output, for a display with HDR turned on in Windows (Settings > System > Display > Use HDR). Off, "
+           "or with Windows' HDR off, the picture is SDR as always.",
+           hdr_note);
+    if (s.hdr) {
+        Values("HDR white", s.hdr_white, {0, 100, 150, 200, 250, 300, 400, 500}, HdrWhite,
+               "How bright the game's white is, and the menus'. Windows' is the SDR content brightness set in "
+               "Windows' HDR settings.");
+        Values("HDR highlights", s.hdr_peak, {0, 400, 600, 800, 1000, 1500, 2000, 4000}, HdrPeak,
+               "How far the game's brightest parts (lights, fire, the sky) are stretched past white. The display's "
+               "is the peak it reports to Windows.");
+    }
     Switch("Vertical sync", s.vsync, "Frames wait for the display's refresh: no tearing, a little more latency.");
     Switch("Low latency", s.low_latency,
            "One frame waits for the display instead of two: what you do shows a frame sooner, above all with vertical "
            "sync on or when the GPU is behind. Off gives a GPU that is just short of the frame rate a frame of room.");
     Switch("Show frame rate", o.show_fps, "The frames a second in the top left corner.");
+    Switch("Show performance stats", o.show_stats,
+           "Where each frame's time goes, in the top left corner: the game's thread, the render thread, handing the "
+           "frame to the display, the GPU's work by kind (the scene, the effects such as ambient occlusion, the final "
+           "picture), the draws, the audio mixer and the busiest threads. Measuring costs a little itself.");
+    Switch("Log performance", o.log_stats,
+           "The same numbers written to logs/tsfp.log for long sessions: an average every ten seconds (with the 1% "
+           "slowest frames), a line for each hitch with what was going on (shaders being made, textures loaded, the "
+           "game waiting), and a summary every five minutes. Send the log to find what to improve.");
+}
+
+// the graphics presets: render scale, MSAA, texture sharpness, edge smoothing, ambient occlusion
+struct Preset {
+    const char* name;
+    const char* help;
+    uint32_t render, msaa, aniso, edge_aa, ao;
+};
+constexpr Preset kPresets[] = {
+    {"Original", "The picture as the console drew it, at your resolution: no smoothing, no extra effects.", 100, 0, 0,
+     0, 0},
+    {"Light", "For older or laptop GPUs: FXAA and sharper textures, nothing heavier.", 100, 0, 4, 1, 0},
+    {"Balanced", "2x MSAA, SMAA and SSAO: smooth edges and contact shadows at a moderate cost.", 100, 2, 8, 2, 1},
+    {"High", "4x MSAA, SMAA, 16x textures and GTAO.", 100, 4, 16, 2, 2},
+    {"Ultra", "High drawn at 150% and shrunk to the screen, the smoothest picture, for strong GPUs.", 150, 4, 16, 2, 2},
+};
+
+// the presets as a row of buttons, the one the settings match lit; "Custom" under them when none does
+void Presets() {
+    app::Settings& s = app::Get();
+    int match = -1;
+    for (int i = 0; i < int(std::size(kPresets)); i++) {
+        const Preset& p = kPresets[i];
+        if (s.render_percent == p.render && s.msaa == p.msaa && s.aniso == p.aniso &&
+            std::min<uint32_t>(s.edge_aa, 2) == p.edge_aa && std::min<uint32_t>(s.ao, 2) == p.ao)
+            match = i;
+    }
+    Heading("PRESET", 1.15f);
+    float avail = ImGui::GetContentRegionAvail().x, gap = ImGui::GetStyle().ItemSpacing.x;
+    float w = (avail - gap * (std::size(kPresets) - 1)) / float(std::size(kPresets));
+    for (int i = 0; i < int(std::size(kPresets)); i++) {
+        if (i) ImGui::SameLine();
+        bool lit = i == match;
+        if (lit) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(kSelected));
+        if (ImGui::Button(kPresets[i].name, {w, 0})) {
+            const Preset& p = kPresets[i];
+            s.render_percent = p.render, s.msaa = p.msaa, s.aniso = p.aniso, s.edge_aa = p.edge_aa, s.ao = p.ao;
+            g_save = true;
+        }
+        if (lit) ImGui::PopStyleColor();
+        Tip(kPresets[i].help, false);
+    }
+    ImGui::TextDisabled("%s", match < 0 ? "Custom" : "");
 }
 
 void GraphicsTab() {
@@ -532,15 +645,17 @@ void ControlsTab() {
         EndLines();
     }
     ImGui::Spacing();
-    ImGui::TextDisabled("Click a key to bind it again, then press the new key or mouse button.");
-    ImGui::TextDisabled("Escape keeps it, Delete clears it; a right click on a key clears it too.");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Click a key to bind it again, then press the new key or mouse button. Escape keeps it, Delete "
+                       "clears it; a right click on a key clears it too.");
+    ImGui::PopStyleColor();
     if (!g_moved.empty()) ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(kAccent), "%s", g_moved.c_str());
     bool busy = g_capture >= 0 || g_cooldown;
     constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_PadOuterX;
     if (ImGui::BeginTable("##keys", 1 + kSlots, kFlags)) {
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.4f);
         for (int k = 0; k < kSlots; k++)
-            ImGui::TableSetupColumn(k == 0 ? "Key" : k == 1 ? "Second key" : "Third key",
+            ImGui::TableSetupColumn(k == 0 ? "Key" : k == 1 ? "2nd" : "3rd",
                                     ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableHeadersRow();
         for (size_t i = 0; const char* id = controls::ActionIds(i); i++) {
@@ -582,7 +697,7 @@ void ControlsTab() {
         ImGui::EndTable();
     }
     ImGui::Spacing();
-    if (ImGui::Button("Reset controls to this game's defaults") && !busy) {
+    if (ImGui::Button("Reset controls to defaults") && !busy) {
         for (size_t i = 0; controls::ActionIds(i); i++) Bind(i, Split(controls::ActionDefaults(i)));
         game::Options& o = game::Opt();
         o.mouse_sensitivity = 100;
@@ -593,6 +708,17 @@ void ControlsTab() {
     Tip("Every action's keys as the port first had them, and the mouse at sensitivity 100, up and down 100%, not "
         "inverted.",
         false);
+}
+
+void StoryCharacterLines() {
+    game::Options& o = game::Opt();
+    std::vector<std::string> names = game::StoryCharacterNames();
+    const char* help = "Who this player is in Story, alone or in co-op: each mission's own, or any of the Arcade "
+                       "characters. Online, both of you choose the same. Takes effect from the next mission.";
+    for (int p = 0; p < 2; p++) {
+        int i = int(std::min<uint32_t>(o.story_character[p], uint32_t(names.size() - 1)));
+        if (Choice(p ? "Story player 2" : "Story player 1", i, names, help)) o.story_character[p] = uint32_t(i);
+    }
 }
 
 void GameplayTab() {
@@ -611,6 +737,7 @@ void GameplayTab() {
         Switch("Fast loading", o.fast_loading, "A loading screen ends when the load does, not when its bar has filled.");
         Switch("Player names in co-op", o.player_names, "Each Story co-op player's name over their head.");
     }
+    StoryCharacterLines();
     // the disc has these five: menus and voices (sounds_e, _f, _g, _s, _i)
     static const uint32_t kLanguages[] = {1, 4, 3, 5, 6};
     uint32_t& language = app::Get().language;
@@ -630,48 +757,39 @@ void EarlyTab() {
     game::Options& o = game::Opt();
     int font = int(o.font);
     if (Choice("Font", font, {"Future Perfect", "TimeSplitters 2", "Arial Bold (early)"},
-               "The text's letters. TimeSplitters 2's are read from your own copy of it for Xbox (its folder below); "
-               "Arial Bold is the early Future Perfect's subtitle font.")) {
+               "The text's letters: TimeSplitters 2's, or Arial Bold, the early Future Perfect's subtitle font.")) {
         o.font = uint32_t(font);
         game::ApplyFont();
     }
     int hud = int(o.hud_style);
     if (Choice("HUD style", hud, {"Future Perfect", "Early (TimeSplitters 2)", "TimeSplitters 1"},
                "Early: TimeSplitters 2's HUD, as the preview had it: the health bars of allies and bosses in the top "
-               "right corner, the health and armour arcs, and the ammunition with its rounds and icons (these read "
-               "from your TimeSplitters 2, its folder below, when a level starts). TimeSplitters 1: the health and "
+               "right corner, the health and armour arcs, and the ammunition with its rounds and icons. "
+               "TimeSplitters 1: the health and "
                "armour bars across the top left corner and the green cross crosshair."))
         o.hud_style = uint32_t(hud);
-    Edit("TimeSplitters 2 folder", o.ts2_folder,
-         "The folder of your TimeSplitters 2 for Xbox, with its default.xbe and data folder. Nothing is copied from "
-         "it; it is read at start. Empty: the ts2 folder beside the game, when there is one.");
+    // the folders the early content was first made from: the release brings it made, so only shown to who set one
+    if (!o.ts2_folder.empty())
+        Edit("TimeSplitters 2 folder", o.ts2_folder,
+             "The folder of your TimeSplitters 2 for Xbox, with its default.xbe and data folder. Nothing is copied "
+             "from it; it is read at start. Empty: the ts2 folder beside the game, when there is one.");
     int skyline = int(o.skyline_model);
     if (Choice("Breaking and Entering skyline", skyline, {"Future Perfect", "Early (2004)"},
                "Early: the yellow towers at sunset around the rooftop, with the NEW-GEN, SIRIUS, PLAZA and SUN-STAR "
-               "signs, from your own preview disc of Future Perfect for PS2 (below). Takes effect when a level starts."))
+               "signs, from the PS2 preview of Future Perfect. Takes effect when a level starts."))
         o.skyline_model = uint32_t(skyline);
-    Edit("Future Perfect preview (PS2)", o.preview_path,
-         "Your disc image (.iso) of the November 2004 preview of Future Perfect for PS2, or a folder of its files "
-         "(with its PAK folder). Nothing is copied from it; the early skyline is made from it when first needed. "
-         "Empty: the preview folder beside the game, when there is one.");
+    if (!o.preview_path.empty())
+        Edit("Future Perfect preview (PS2)", o.preview_path,
+             "Your disc image (.iso) of the November 2004 preview of Future Perfect for PS2, or a folder of its files "
+             "(with its PAK folder). Nothing is copied from it; the early skyline is made from it when first needed. "
+             "Empty: the preview folder beside the game, when there is one.");
 }
 
 // Story's players' characters, alone or in co-op
-void StoryCharacterLines() {
-    game::Options& o = game::Opt();
-    std::vector<std::string> names = game::StoryCharacterNames();
-    const char* help = "Who this player is in Story, alone or in co-op: each mission's own, or any of the Arcade "
-                       "characters. Online, both of you choose the same. Takes effect from the next mission.";
-    for (int p = 0; p < 2; p++) {
-        int i = int(std::min<uint32_t>(o.story_character[p], uint32_t(names.size() - 1)));
-        if (Choice(p ? "Story player 2" : "Story player 1", i, names, help)) o.story_character[p] = uint32_t(i);
-    }
-}
 
 // Co-op: Story's players' characters; an online session (the main menu's Story > Host or Join Online Story, or
 // --host and --join) started, shown and left here
 void CoopTab() {
-    StoryCharacterLines();
     game::Options& o = game::Opt();
     if (lockstep::Active()) {
         Fixed("Session", lockstep::Status(), "Each of you plays your own player full screen; the game is the same on both.");
@@ -746,32 +864,123 @@ void DrawFps(double fps) {
     dl->AddText(g_font, size, p, kAccent, text);
 }
 
+// The performance overlay: the backend's numbers (gpu::Stats, every half second) as a column of milliseconds a frame
+// and their share of the frame, lit yellow past half of it and red past nine tenths, in the top left corner.
+struct StatRow {
+    std::string text;
+    ImU32 colour;
+};
+__attribute__((format(printf, 3, 4))) void AddStat(std::vector<StatRow>& rows, ImU32 c, const char* fmt, ...) {
+    char b[160];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    rows.push_back({b, c});
+}
+
+void DrawStats(bool below_fps) {
+    gpu::FrameStats st = gpu::Stats();
+    ImFont* f = g_mono ? g_mono : g_text;
+    if (!f) return;
+    float size = f->FontSize, line = size * 1.15f;
+    using Row = StatRow;
+    std::vector<Row> rows;
+    const ImU32 kPlain = IM_COL32(150, 235, 150, 255), kDim = IM_COL32(150, 170, 150, 255),
+                kHead = IM_COL32(255, 255, 255, 255), kWarn = IM_COL32(255, 210, 80, 255),
+                kBad = IM_COL32(255, 90, 80, 255);
+    double frame = st.frame > 0 ? st.frame : 1;
+    auto level = [&](double ms) { return ms > frame * 0.9 ? kBad : ms > frame * 0.5 ? kWarn : kPlain; };
+    auto ms_row = [&](int depth, const char* name, double ms, bool share) {
+        char label[32];
+        std::snprintf(label, sizeof(label), "%*s%s", depth * 2, "", name);
+        if (share)
+            AddStat(rows, depth ? kDim : level(ms), "%-16s%7.2f ms %4.0f%%", label, ms, ms / frame * 100);
+        else
+            AddStat(rows, depth ? kDim : kPlain, "%-16s%7.2f ms", label, ms);
+    };
+    if (!st.valid) {
+        AddStat(rows, kDim, "measuring...");
+    } else {
+        AddStat(rows, st.worst > frame * 1.5 ? kWarn : kHead, "%5.1f FPS %6.2f ms  worst %.1f", st.fps, st.frame, st.worst);
+        if (st.shown_fps > st.fps * 1.2) AddStat(rows, kDim, "on screen %5.1f FPS (interpolated)", st.shown_fps);
+        AddStat(rows, kDim, "draws %5.0f  tris %6.1fk  upload %4.1f MB", st.draws, st.tris / 1000, st.upload_mb);
+        AddStat(rows, kHead, "CPU a frame");
+        ms_row(1, "game threads", st.game, true);
+        ms_row(2, "waits render", st.game_wait, false);
+        ms_row(2, "frame cap", st.pace, false);
+        ms_row(1, "render thread", st.render, true);
+        ms_row(2, "draws", st.draw, false);
+        ms_row(2, "copies, clears", st.copy, false);
+        if (st.compile >= 0.005) ms_row(2, "shaders", st.compile, false);
+        ms_row(1, "present", st.present, true);
+        ms_row(2, "swap", st.swap, false);
+        ms_row(2, "vsync, cap", st.vsync, false);
+        AddStat(rows, kDim, "  audio mixer   %5.1f%% of a core", st.audio);
+        AddStat(rows, kHead, "GPU a frame");
+        ms_row(1, "in all", st.gpu, true);
+        static const char* kNames[8] = {"scene (MSAA)", "scene", "small targets", "resolves", "copies",
+                                        "final picture", "effects (AO)", "other"};
+        for (int i = 0; i < 8; i++)
+            if (st.gpu_pass[i] >= 0.01) ms_row(2, kNames[i], st.gpu_pass[i], false);
+        if (st.shaders || st.pipelines)
+            AddStat(rows, kWarn, "new %.0f shaders %.0f pipelines", st.shaders, st.pipelines);
+        if (st.threads[0]) {
+            AddStat(rows, kHead, "Busiest threads (a core)");
+            // one line each: "name 30%, name 20%"
+            std::string t = st.threads;
+            for (size_t at = 0; at < t.size();) {
+                size_t comma = t.find(", ", at);
+                std::string part = t.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                AddStat(rows, kDim, "  %s", part.c_str());
+                if (comma == std::string::npos) break;
+                at = comma + 2;
+            }
+        }
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    float fps_size = std::clamp(io.DisplaySize.y / 900.0f, 0.75f, 2.5f) * 24;
+    ImVec2 p{fps_size * 0.6f, below_fps ? fps_size * 1.6f : fps_size * 0.4f};
+    float w = 0;
+    for (const Row& r : rows) w = std::max(w, f->CalcTextSizeA(size, FLT_MAX, 0, r.text.c_str()).x);
+    float pad = size * 0.5f;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled({p.x - pad, p.y - pad}, {p.x + w + pad, p.y + line * float(rows.size()) + pad},
+                      IM_COL32(0, 0, 0, 150), size * 0.3f);
+    for (const Row& r : rows) {
+        dl->AddText(f, size, p, r.colour, r.text.c_str());
+        p.y += line;
+    }
+}
+
 struct Tab {
     const char* name;
+    const char* heading;
     void (*draw)();
-    bool lines;  // its settings are lines of the two column table
+    bool lines;            // its settings are lines of the two column table
+    void (*above)() = nullptr;  // drawn over its lines
 };
 
 constexpr Tab kTabs[] = {
-    {"Display", DisplayTab, true},  {"Graphics", GraphicsTab, true}, {"Controls", ControlsTab, false},
-    {"Gameplay", GameplayTab, true}, {"Mods", ModsTab, true},
-    {"Co-op", CoopTab, true},
+    {"Display", "DISPLAY", DisplayTab, true},
+    {"Graphics", "GRAPHICS", GraphicsTab, true, Presets},
+    {"Controls", "CONTROLS", ControlsTab, false},
+    {"Gameplay", "GAMEPLAY", GameplayTab, true},
+    {"Mods", "MODS", ModsTab, true},
+    {"Co-op", "CO-OP AND ONLINE", CoopTab, true},
 };
 constexpr int kTabCount = int(std::size(kTabs));
 
 // the window: the tabs, and a last line that is always there
 void Draw() {
     ImGuiIO& io = ImGui::GetIO();
-    g_scale = std::clamp(io.DisplaySize.y / 1080.0f, 1.0f, 2.4f);
     ImGuiStyle saved = ImGui::GetStyle();
-    float saved_font = io.FontGlobalScale;
     if (!g_styled) {
         g_base_style = saved;
         g_styled = true;
     }
     ImGui::GetStyle() = g_base_style;
     Style();
-    io.FontGlobalScale = g_scale * kTextPx / kFontPx;
 
     if (g_capture < 0 && !io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) g_force_tab = (g_tab + kTabCount - 1) % kTabCount;
@@ -779,44 +988,81 @@ void Draw() {
         if (ImGui::IsKeyDown(ImGuiKey_ModCtrl) && ImGui::IsKeyPressed(ImGuiKey_Tab, false))
             g_force_tab = (g_tab + (ImGui::IsKeyDown(ImGuiKey_ModShift) ? kTabCount - 1 : 1)) % kTabCount;
     }
-    ImVec2 size{std::min(Px(620), io.DisplaySize.x * 0.96f), std::min(Px(540), io.DisplaySize.y * 0.92f)};
-    ImGui::SetNextWindowPos({io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f}, ImGuiCond_Appearing, {0.5f, 0.5f});
+    // a column down the right side, the game seen beside it, as God of War PSP's launcher has its options: 440 px
+    // wide, 10 point text (13 px), 12 point headings
+    float margin = Px(10);
+    ImVec2 size{std::min(Px(440), io.DisplaySize.x - 2 * margin), io.DisplaySize.y - 2 * margin};
+    ImGui::SetNextWindowPos({io.DisplaySize.x - margin, margin}, ImGuiCond_Appearing, {1, 0});
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSizeConstraints({Px(380), Px(260)}, io.DisplaySize);
+    ImGui::SetNextWindowSizeConstraints({Px(360), Px(300)}, io.DisplaySize);
     bool open = true;
-    constexpr ImGuiWindowFlags kFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    if (g_force_tab >= 0) g_tab = g_force_tab;
+    g_force_tab = -1;
+    constexpr ImGuiWindowFlags kFlags =
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
     if (ImGui::Begin("Settings###settings_panel", &open, kFlags)) {
-        float last = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
-        ImGui::BeginChild("##body", {0, -last}, ImGuiChildFlags_NavFlattened);
-        if (ImGui::BeginTabBar("##tabs")) {
-            for (int i = 0; i < kTabCount; i++) {
-                ImGuiTabItemFlags flags = g_force_tab == i ? ImGuiTabItemFlags_SetSelected : 0;
-                if (!ImGui::BeginTabItem(kTabs[i].name, nullptr, flags)) continue;
-                g_tab = i;
-                ImGui::BeginChild("##page", {0, 0}, ImGuiChildFlags_NavFlattened);
-                if (!kTabs[i].lines) {
-                    kTabs[i].draw();
-                } else if (BeginLines("##lines")) {
-                    kTabs[i].draw();
-                    EndLines();
-                }
-                ImGui::EndChild();
-                ImGui::EndTabItem();
+        // the ground: deep blue falling to near black, a steel frame with a lighter inner line
+        ImDrawList* bg = ImGui::GetWindowDrawList();
+        ImVec2 a = ImGui::GetWindowPos(), b{a.x + ImGui::GetWindowWidth(), a.y + ImGui::GetWindowHeight()};
+        bg->AddRectFilledMultiColor(a, b, kPanelTop, kPanelTop, kPanelBg, kPanelBg);
+        bg->AddRect(a, b, kSteel, Px(4), 0, Px(2));
+        bg->AddRect({a.x + Px(4), a.y + Px(4)}, {b.x - Px(4), b.y - Px(4)}, kSteelDim, Px(3), 0, Px(1));
+
+        // the header: the game's name in Impact, what this is under it, a close button
+        ImGui::SetCursorPos({Px(14), Px(12)});
+        ImGui::BeginGroup();
+        Heading("TIMESPLITTERS", kTitle);
+        ImGui::TextDisabled("FUTURE PERFECT  \xC2\xB7  PC PORT  \xC2\xB7  UNOFFICIAL");
+        ImGui::EndGroup();
+        float close = ImGui::GetFrameHeight();
+        ImGui::SameLine(ImGui::GetWindowWidth() - close - Px(14));
+        ImGui::SetCursorPosY(Px(14));
+        if (ImGui::Button("X##close", {close, close})) open = false;
+        Tip("Close (Esc, or B on a pad). The settings are saved.", false);
+        ImGui::SetCursorPosX(Px(12));
+        Rule();
+
+        // the pages in two rows of buttons, the chosen one lit
+        constexpr int kPerRow = 3;
+        float avail = ImGui::GetContentRegionAvail().x, gap = Px(4);
+        float w = (avail - gap * (kPerRow - 1)) / kPerRow;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {gap, gap});
+        for (int i = 0; i < kTabCount; i++) {
+            if (i % kPerRow) ImGui::SameLine();
+            bool on = g_tab == i;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(kSelected));
+            if (ImGui::Button(kTabs[i].name, {w, 0})) g_tab = i;
+            if (on) {
+                ImGui::PopStyleColor();
+                ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                ImGui::GetWindowDrawList()->AddRectFilled({a.x, b.y - Px(2)}, b, kAccent);
             }
-            ImGui::EndTabBar();
         }
-        g_force_tab = -1;
+        ImGui::PopStyleVar();
+        ImGui::Dummy({0, Px(2)});
+
+        float last = ImGui::GetTextLineHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        // the page: its heading, then its settings in a steel frame
+        ImGui::BeginChild("##page", {0, -last}, ImGuiChildFlags_NavFlattened);
+        const Tab& tab = kTabs[std::clamp(g_tab, 0, kTabCount - 1)];
+        Heading(tab.heading, kHeadingSize);
+        Rule();
+        if (tab.above) tab.above();
+        ImGui::BeginChild("##lines_frame", {0, 0}, ImGuiChildFlags_Border | ImGuiChildFlags_NavFlattened);
+        if (!tab.lines) {
+            tab.draw();
+        } else if (BeginLines("##lines")) {
+            tab.draw();
+            EndLines();
+        }
         ImGui::EndChild();
-        ImGui::Separator();
-        if (ImGui::Button("Close")) open = false;
-        ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Esc  close     Ctrl+Tab  next tab     pad: A choose, B close, LB/RB tab");
+        ImGui::EndChild();
+
+        ImGui::TextDisabled("Esc close   Ctrl+Tab page   pad: A, B close, LB/RB page");
     }
     ImGui::End();
     if (!open && g_capture < 0 && !g_cooldown) SetOpen(false);
 
-    io.FontGlobalScale = saved_font;
     ImGui::GetStyle() = saved;
 }
 
@@ -834,16 +1080,43 @@ void Start() {
         c.SizePixels = kFontPx;
         g_font = io.Fonts->AddFontDefault(&c);
     }
+    // the sizes on the screen the game starts on (g_scale's rule), whole pixels
+    float scale = std::clamp(float(GetSystemMetrics(SM_CYSCREEN)) / 1080.0f, 1.0f, 2.4f);
+    g_text_px = std::round(kTextPx * scale);
+    ImFontConfig sharp;
+    sharp.OversampleH = 3;
+    sharp.PixelSnapH = true;
+    if (n && std::filesystem::exists(font, ec))
+        g_text = io.Fonts->AddFontFromFileTTF(font.string().c_str(), g_text_px, &sharp);
+    if (!g_text) g_text = g_font;
+    io.FontDefault = g_text;
+    std::filesystem::path mono = std::filesystem::path(std::wstring(dir, n)) / L"Fonts" / L"consola.ttf";
+    if (n && std::filesystem::exists(mono, ec))
+        g_mono = io.Fonts->AddFontFromFileTTF(mono.string().c_str(), g_text_px, &sharp);
+    std::filesystem::path impact = std::filesystem::path(std::wstring(dir, n)) / L"Fonts" / L"impact.ttf";
+    if (n && std::filesystem::exists(impact, ec)) {
+        g_title_font = io.Fonts->AddFontFromFileTTF(impact.string().c_str(), std::round(g_text_px * kTitle), &sharp);
+        g_heading_font =
+            io.Fonts->AddFontFromFileTTF(impact.string().c_str(), std::round(g_text_px * kHeadingSize), &sharp);
+    }
 }
 
 void Ui(double fps) {
+    // the text's size: ImGui takes it in at the start of a frame (NewFrame), so it is set for the frames to come;
+    // changed only while drawing, the panel's text was drawn at the size its letters are made at
+    ImGuiIO& io = ImGui::GetIO();
+    g_scale = std::clamp(io.DisplaySize.y / 1080.0f, 1.0f, 2.4f);
+    io.FontGlobalScale = g_scale * kTextPx / (g_text ? g_text->FontSize : kFontPx);
     if (game::Opt().show_fps) DrawFps(fps);
+    // the overlay measures while it is shown, without the log lines of F9's measurement
+    diag::StatsFlag().store(game::Opt().show_stats, std::memory_order_relaxed);
+    diag::StatsLogFlag().store(game::Opt().log_stats, std::memory_order_relaxed);
+    if (game::Opt().show_stats) DrawStats(game::Opt().show_fps);
     DrawNotice();
     bool open = g_open;
     if (open && !g_was_open) Stage();
     g_was_open = open;
     // waiting for a binding the keys are the binding's, not the panel's
-    ImGuiIO& io = ImGui::GetIO();
     constexpr int kNav = ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     if (open && g_capture >= 0) {
         if (io.ConfigFlags & kNav) g_nav_flags = io.ConfigFlags & kNav;

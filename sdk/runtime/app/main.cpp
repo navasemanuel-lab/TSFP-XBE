@@ -74,7 +74,7 @@ void DumpThreads() {
     gpu::g_capture = true;
     for (auto& t : kernel::Threads())
         if (t->ctx) {
-            LOGI("thread %X", t->id);
+            LOGR("capture (F3): guest thread %X, where it is (not a fault)", t->id);
             kernel::LogGuestStack(*t->ctx, 32);
         }
 }
@@ -227,6 +227,7 @@ void Pace() {
     next += period;
     if (next < now - period) next = now;
     SleepUntil(next);
+    diag::g_pace_ns += uint64_t(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - now).count()));
 }
 
 // a waitable timer of the thread's, high resolution where Windows has it (10 1803 on): good to about half a

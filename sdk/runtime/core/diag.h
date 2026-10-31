@@ -11,7 +11,25 @@ inline std::atomic<bool>& PerfFlag() {
     static std::atomic<bool> on{std::getenv("XBE_PERF") != nullptr};
     return on;
 }
-inline bool Perf() { return PerfFlag().load(std::memory_order_relaxed); }
+// the performance overlay (panel): measured as for the log, shown on screen, no log lines
+inline std::atomic<bool>& StatsFlag() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+// the performance log (panel): the overlay's numbers in the log every ten seconds, each hitch as it happens, a summary
+// every five minutes, for long sessions
+inline std::atomic<bool>& StatsLogFlag() {
+    static std::atomic<bool> on{false};
+    return on;
+}
+inline bool Perf() {
+    return PerfFlag().load(std::memory_order_relaxed) || StatsFlag().load(std::memory_order_relaxed) ||
+           StatsLogFlag().load(std::memory_order_relaxed);
+}
+// the perf log lines: XBE_PERF or F9, not the overlay alone
+inline bool PerfLog() { return PerfFlag().load(std::memory_order_relaxed); }
+// the title's thread asleep in the frame cap (app::Pace), nanoseconds: not the game's work
+inline std::atomic<uint64_t> g_pace_ns{0};
 
 // XBE_CAPTURE_DIR: where F3 saves a frame, "captures" beside the executable when unset, set empty: F3 does not capture
 inline const std::filesystem::path& CaptureDir() {

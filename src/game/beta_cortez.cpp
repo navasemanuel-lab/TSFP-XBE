@@ -870,6 +870,63 @@ X86_FUNC(sub_00062E20) {
     LogServed(path, "streamed");
 }
 
+namespace {
+
+// The streamed characters go one to a slot of a pool, the model and then each texture read one after another into the
+// slot's memory, each rounded up to 0x800 (0x3F050), with no check that they fit. The character select's pools have
+// slots for the game's own characters (4 of 0xB4000, and 6 of 0x8E800); a mod's bigger one ran over into the next
+// slot, whose character then wrote over its textures (the beta Cortez drew as noise, after some other characters).
+// Their slots are made the size of the mods' biggest character, when the memory they come from has room for it.
+constexpr uint32_t kSelectPools[] = {0x2D6EF6, 0x302AD7};  // return addresses of MakePool's calls
+constexpr uint32_t kArenaLeft = 0x6B8384;   // what is left of the memory pools come from (0x3E0B0, kind 1)
+constexpr uint32_t kArenaSpare = 4 << 20;   // left for the rest of the screen
+constexpr uint32_t kPakTexture = 0xB000;    // a texture the mods lack: a 256x256 DXT1 with its mip levels
+
+uint32_t Rounded(size_t n) { return uint32_t((n + 0x7FF) & ~size_t(0x7FF)); }
+
+// the slot the biggest character the mods give takes: its model and the textures its table names (at the offset in
+// its first word, 16 bytes each, ended by -1)
+uint32_t ModCharacterSlot() {
+    uint32_t most = 0;
+    for (const std::string& path : game::mods::Paths("assets/ts/models/chrs/")) {
+        if (path.size() < 4 || path.compare(path.size() - 4, 4, ".xbr")) continue;
+        const std::vector<uint8_t>* model = game::mods::File(path);
+        if (!model || model->size() < 4) continue;
+        uint32_t need = Rounded(model->size()), at;
+        std::memcpy(&at, model->data(), 4);
+        for (; size_t(at) + 4 <= model->size(); at += 16) {
+            uint32_t id;
+            std::memcpy(&id, model->data() + at, 4);
+            if (id == 0xFFFFFFFF) break;
+            char name[32];
+            std::snprintf(name, sizeof(name), "textures/%06x.xbt", id);
+            const std::vector<uint8_t>* texture = game::mods::File(name);
+            need += texture ? Rounded(texture->size()) : kPakTexture;
+        }
+        most = std::max(most, need);
+    }
+    return most;
+}
+
+}  // namespace
+
+// MakePool(pool, slots, slot size): a pool's slots, from the arena; the character select's made big enough for the
+// mods' characters
+X86_EXTERN_FUNC(__imp__sub_0003EE70);
+X86_FUNC(sub_0003EE70) {
+    uint32_t from = kernel::R32(ctx.esp), slots = kernel::R32(ctx.esp + 8), size = kernel::R32(ctx.esp + 12);
+    if (std::find(std::begin(kSelectPools), std::end(kSelectPools), from) != std::end(kSelectPools)) {
+        uint32_t need = ModCharacterSlot(), left = kernel::R32(kArenaLeft);
+        if (need > size && uint64_t(slots) * need + kArenaSpare <= left) {
+            kernel::W32(ctx.esp + 12, need);
+            LOGR("mods: character slots %u x %X made %X for the mods' characters", slots, size, need);
+        } else if (need > size) {
+            LOGW("mods: character slots %u x %X too small for the mods' characters (%X), %X left", slots, size, need, left);
+        }
+    }
+    __imp__sub_0003EE70(ctx, base);
+}
+
 // ReadStream(handle, buffer, offset, size, priority): a read started, done at once on the beta's files
 X86_EXTERN_FUNC(__imp__sub_00029370);
 X86_FUNC(sub_00029370) {

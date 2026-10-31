@@ -38,6 +38,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "audio/audio.h"
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -66,6 +67,11 @@ constexpr uint32_t kDsvCount = 256;
 constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
 constexpr uint32_t kQueries = 8192;  // occlusion queries in flight, several frames of counted draws
 constexpr uint32_t kLowProfileAniso = 4;  // the low graphics profile's most anisotropic filtering
+// how long after a menu's last tick the scene keeps drawing without MSAA when play has not taken the mouse
+constexpr uint64_t kMenuMsaaMs = 3000;
+// a menu's or play's tick this recent: one is up now
+constexpr uint64_t kRecentTickMs = 250;
+
 // the scene's samples a pixel as set: none in the low graphics profile
 // and the final picture's edges smoothed after, with it or alone: FXAA (PostAa) or by the edges' shapes (SmaaOn)
 uint32_t SceneMsaa() { return app::Get().low_profile || app::Get().msaa < 2 ? 0 : app::Get().msaa; }
@@ -120,8 +126,8 @@ struct Perf {
     uint64_t raw = 0;
     uint64_t lates = 0;
     // the GPU's time by the kind of work (GpuPass), and the draws of each
-    double pass_ms[7] = {};
-    uint64_t pass_draws[7] = {};
+    double pass_ms[8] = {};
+    uint64_t pass_draws[8] = {};
     // the same by target (TargetTag): milliseconds and draws
     std::unordered_map<uint64_t, std::pair<double, uint64_t>> by_target;
 };
@@ -129,9 +135,10 @@ Perf g_perf;
 
 // what the GPU is working on, for the measurement's split of its time: draws into the scene's multisampled targets,
 // full size single sampled ones, the smaller ones (shadows, blur, cameras), MSAA resolves and copies made for reading,
-// the game's surface copies (the front buffer's among them), and the picture put on screen with the overlay
-enum class GpuPass : uint8_t { Scene, Full, Small, Resolve, Copy, Final, Other };
-constexpr const char* kGpuPassNames[] = {"scene", "full", "small", "resolve", "copy", "final", "other"};
+// the game's surface copies (the front buffer's among them), the picture put on screen with the overlay, and the
+// backend's own effects laid on the scene (the ambient occlusion)
+enum class GpuPass : uint8_t { Scene, Full, Small, Resolve, Copy, Final, Effects, Other };
+constexpr const char* kGpuPassNames[] = {"scene", "full", "small", "resolve", "copy", "final", "effects", "other"};
 // timed only while the measurement is on (F9): the clock is read many times a draw
 struct PerfScope {
     double& acc;
@@ -257,35 +264,102 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
-// Ambient occlusion (app::Settings::ao) from the scene's depth: the view distance of a depth pixel is the projection's
-// w (p0: the stored depth's scale and offset into z/w, the projection's z offset), its position across the view from
-// the projection's x and y scales (p0.w, p1.x). occlude, at half size: SSAO (p1.w 1) takes 12 points on a spiral
-// within the radius (p1.y, in view units) and counts those above the surface's plane; GTAO (2) walks 3 directions
-// both ways for the highest horizon and integrates the cosine-weighted sky the surface sees between them. apply, at
-// full size: the half size result blurred within surfaces of a like depth, multiplied into the picture (p1.z strength)
-const char* kAoHlsl = R"(
+// HDR10 (app::Settings::hdr): the frame drawn as for an SDR display (img) and the overlay drawn over it (ui,
+// premultiplied, cleared clear) into the display's signal: the display gamma taken off (2.2), white at p0.x nits, the
+// game's highlights stretched towards the peak p0.y by an inverse Reinhard on luminance, so hues keep and white
+// reaches most (as SCDA-XBERecomp does it, MIT), the overlay never; BT.709's primaries into BT.2020's, PQ (SMPTE ST
+// 2084) of 10000 nits
+const char* kHdrHlsl = R"(
 cbuffer B : register(b1) { float4 p0; float4 p1; };
-Texture2D<float> dep : register(t0);
-Texture2D<float> occ : register(t1);
-static const float kPi = 3.14159265;
+Texture2D img : register(t0);
+Texture2D ui : register(t1);
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
-int2 Size() {
+static const float3x3 k709To2020 = {0.627404, 0.329283, 0.043313, 0.069097, 0.919540, 0.011362,
+                                    0.016391, 0.088013, 0.895595};
+float3 Pq(float3 nits) {
+    float3 y = pow(saturate(nits / 10000.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+static const float3 kLum = float3(0.2126, 0.7152, 0.0722);
+float3 Expand(float3 c, float most) { return c / (1 - dot(c, kLum) * (1 - 1 / most)); }
+float4 pq(float4 pos : SV_Position) : SV_Target {
+    int3 at = int3(pos.xy, 0);
+    float3 c = pow(saturate(img.Load(at).rgb), 2.2);
+    float3 nits = min(Expand(c, max(p0.y / p0.x, 1)) * p0.x, max(p0.y, p0.x));
+    float4 o = ui.Load(at);
+    float3 over = o.a > 0 ? pow(saturate(o.rgb / o.a), 2.2) * p0.x : 0;
+    nits = nits * (1 - o.a) + over * o.a;
+    return float4(Pq(mul(k709To2020, nits)), 1);
+}
+)";
+
+// Ambient occlusion (app::Settings::ao) from the scene's depth, worked out at a small size (the picture's over a whole
+// factor, p1.y: about 540 lines, so the same work at 1080p, 1440p or 4K) and laid on at full size. The view distance
+// of a depth pixel is the projection's w (p0: the stored depth's scale and offset into z/w, the projection's z
+// offset), its position across the view from the projection's x and y scales (p0.w, p1.x); nearer than p1.z (the
+// first-person arms and gun, drawn in the depth buffer's first part with a projection of their own) counts as nothing
+// drawn. The entries read t0 to t3 as named:
+//   lin (small): t0 the depth, t2 the depth at the last pass: the view distance, 0 for nothing drawn, negated where
+//     the last pass already darkened it (the depth unchanged since)
+//   albedo (small): t3 the picture: its colour, for the light its surfaces bounce
+//   occlude (small): t1 lin: SSAO (p1.w 1) takes 12 points on a spiral within the radius (kRadius, in view units)
+//     and counts those above the surface's plane; GTAO (2) walks 3 directions both ways for the highest horizon and
+//     integrates the cosine-weighted sky the surface sees between them
+//   blur (small): t0 albedo, t1 lin, t3 occlude: the occlusion averaged within surfaces of a like distance, the colour
+//     beside it (rgb colour, a occlusion)
+//   apply (full): t0 the depth, t1 lin, t2 the depth at the last pass, t3 blur: the four nearest small pixels of a like
+//     distance, multiplied into the picture with the light the surfaces bounce
+// Worked out at half size and blurred at full size, with the whole picture copied for its colour, it took 30 ms of a
+// GTX 1660's frame at 4K: 25 full size depth pixels read for each pixel on screen.
+const char* kAoHlsl = R"(
+cbuffer B : register(b1) { float4 p0; float4 p1; };
+Texture2D<float4> t0 : register(t0);
+Texture2D<float4> t1 : register(t1);
+Texture2D<float4> t2 : register(t2);
+Texture2D<float4> t3 : register(t3);
+static const float kPi = 3.14159265;
+static const float kRadius = 0.75;
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+int2 Dim(Texture2D<float4> t) {
     uint w, h;
-    dep.GetDimensions(w, h);
+    t.GetDimensions(w, h);
     return int2(w, h);
 }
-// 0: nothing drawn there (the cleared far plane, the sky)
-float Dist(int2 c) {
-    float d = dep.Load(int3(clamp(c, 0, Size() - 1), 0));
+int Factor() { return int(p1.y + 0.5); }
+// a full size depth pixel's view distance; 0: nothing drawn there (the far plane, the sky) or the arms
+float DepthDist(float d) {
     if (d <= 0) return 0;
     float w = p0.z / ((1 - d) * p0.y - p0.x);
-    return w > 0 ? w : 0;
+    return w > p1.z ? w : 0;
 }
+// the full size pixel in the middle of a small one
+int2 Middle(int2 c) { return min(c * Factor() + Factor() / 2, Dim(t0) - 1); }
+
+float lin(float4 pos : SV_Position) : SV_Target {
+    int2 f = Middle(int2(pos.xy));
+    float d = t0.Load(int3(f, 0)).r;
+    float w = DepthDist(d);
+    return w > 0 && d == t2.Load(int3(f, 0)).r ? -w : w;
+}
+
+float4 albedo(float4 pos : SV_Position) : SV_Target {
+    int k = Factor(), q = max(k / 4, 1);
+    int2 f = int2(pos.xy) * k + k / 2, m = Dim(t3) - 1;
+    float3 c = t3.Load(int3(min(f + int2(-q, -q), m), 0)).rgb + t3.Load(int3(min(f + int2(q, -q), m), 0)).rgb +
+               t3.Load(int3(min(f + int2(-q, q), m), 0)).rgb + t3.Load(int3(min(f + int2(q, q), m), 0)).rgb;
+    return float4(c / 4, 1);
+}
+
+// the small distances: drawn before the last pass or not, all are surfaces that occlude
+float Dist(int2 c) { return abs(t1.Load(int3(clamp(c, 0, Dim(t1) - 1), 0)).r); }
 float3 View(int2 c, float w) {
-    float2 n = (float2(c) + 0.5) / float2(Size()) * 2 - 1;
+    float2 n = (float2(c) + 0.5) / float2(Dim(t1)) * 2 - 1;
     return float3(n.x * w * p0.w, -n.y * w * p1.x, w);
 }
 // the surface's normal from the nearer neighbour on each axis, so an edge does not bend it
@@ -350,35 +424,71 @@ float Gtao(int2 c, float3 P, float3 N, float rpx, float R, float noise) {
     return saturate(vis / 3);
 }
 float occlude(float4 pos : SV_Position) : SV_Target {
-    int2 c = int2(pos.xy) * 2;
-    float w = Dist(c);
+    int2 c = int2(pos.xy);
+    float w = t1.Load(int3(c, 0)).r;
+    // nothing drawn, or darkened by the last pass: nothing to count
     if (w <= 0) return 1;
     float3 P = View(c, w);
     float3 N = Normal(c, P);
-    float R = p1.y;
     // the radius across the screen: the projection's x scale over the half width
-    float rpx = clamp(R / (p0.w * w) * Size().x * 0.5, 2, Size().x * 0.08);
-    float noise = Noise(int2(pos.xy));
-    return p1.w > 1.5 ? Gtao(c, P, N, rpx, R, noise) : Ssao(c, P, N, rpx, R, noise);
+    float rpx = clamp(kRadius / (p0.w * w) * Dim(t1).x * 0.5, 2, Dim(t1).x * 0.08);
+    float noise = Noise(c);
+    return p1.w > 1.5 ? Gtao(c, P, N, rpx, kRadius, noise) : Ssao(c, P, N, rpx, kRadius, noise);
 }
-float4 apply(float4 pos : SV_Position) : SV_Target {
-    int2 c = int2(pos.xy);
-    float w = Dist(c);
-    if (w <= 0) return 1;
-    uint ow, oh;
-    occ.GetDimensions(ow, oh);
-    int2 h = c / 2;
+
+float4 blur(float4 pos : SV_Position) : SV_Target {
+    int2 c = int2(pos.xy), m = Dim(t1) - 1;
+    float3 colour = t0.Load(int3(c, 0)).rgb;
+    float w = t1.Load(int3(c, 0)).r;
+    if (w <= 0) return float4(colour, 1);
     float sum = 0, wsum = 0;
     [unroll] for (int y = -2; y <= 2; y++)
         [unroll] for (int x = -2; x <= 2; x++) {
-            int2 q = clamp(h + int2(x, y), 0, int2(ow, oh) - 1);
-            float k = exp(-abs(Dist(q * 2) - w) / (0.04 * w + 0.01));
-            sum += occ.Load(int3(q, 0)) * k;
+            int2 q = clamp(c + int2(x, y), 0, m);
+            float wq = t1.Load(int3(q, 0)).r;
+            // left out: nothing drawn, or darkened before (its occlusion was not counted again)
+            if (wq <= 0) continue;
+            float k = exp(-abs(wq - w) / (0.04 * w + 0.01));
+            sum += t3.Load(int3(q, 0)).r * k;
             wsum += k;
         }
     // far scenery keeps its own shading: the radius is a few pixels there and only noise would show
-    float ao = lerp(1, sum / max(wsum, 1e-4), p1.z * saturate(2 - w / 150));
-    return float4(ao, ao, ao, 1);
+    return float4(colour, lerp(1, sum / max(wsum, 1e-4), saturate(2 - w / 150)));
+}
+
+float4 apply(float4 pos : SV_Position) : SV_Target {
+    int2 c = int2(pos.xy);
+    float d = t0.Load(int3(c, 0)).r;
+    // darkened by an earlier pass, with what has been laid over it since (a glow, smoke, text) on top
+    if (d == t2.Load(int3(c, 0)).r) return 1;
+    float w = DepthDist(d);
+    if (w <= 0) return 1;
+    // the four small pixels around this one, by their nearness and the likeness of their distance to its own
+    float2 f = (float2(c) + 0.5) / Factor() - 0.5;
+    int2 b = int2(floor(f)), m = Dim(t1) - 1;
+    float2 t = f - b;
+    float ao = 0, wsum = 0;
+    float3 colour = 0;
+    [unroll] for (int i = 0; i < 4; i++) {
+        int2 o = int2(i & 1, i >> 1), q = clamp(b + o, 0, m);
+        float wq = t1.Load(int3(q, 0)).r;
+        if (wq <= 0) continue;
+        float k = (o.x ? t.x : 1 - t.x) * (o.y ? t.y : 1 - t.y) + 1e-3;
+        k *= exp(-abs(wq - w) / (0.04 * w + 0.01));
+        float4 s = t3.Load(int3(q, 0));
+        ao += s.a * k;
+        colour += s.rgb * k;
+        wsum += k;
+    }
+    if (wsum < 1e-5) return 1;
+    ao /= wsum;
+    // the light that bounces between what the occlusion counts (Jimenez et al., GTAO's multi-bounce fit): a bright
+    // surface's creases are lit by its own walls and darken less, a dark one's more, in its own colour. The picture's
+    // colour stands in for the surface's (a lit wall reads bright, a corner in shadow dark), made linear by squaring
+    float3 a = colour / wsum;
+    a *= a;
+    float3 mb = max(ao, ((ao * (2.0404 * a - 0.3324) + (-4.7951 * a + 0.6417)) * ao + (2.7552 * a + 0.6903)) * ao);
+    return float4(mb, 1);
 }
 )";
 
@@ -900,6 +1010,12 @@ private:
     uint32_t Samples(uint32_t want);
     uint32_t msaa_ = 1;      // samples of the scene's targets
     uint32_t msaa_set_ = 0;  // the setting they came from
+    bool menu_mode_ = false;  // a menu is up or was last, play not yet back: the scene without MSAA (ApplySettings)
+    // the most samples while the GPU has no room for them (FitMsaa): 0 none, else 4 or 2, cleared for a menu
+    uint32_t msaa_cap_ = 0;
+    double busy_ms_ = 0;  // the GPU's time on the frames since busy_since_
+    std::chrono::steady_clock::time_point busy_since_{};
+    void FitMsaa(double gpu_ms);
     uint32_t latency_set_ = 2;  // frames queued for the display (FrameLatency)
     static D3D12_RESOURCE_STATES CopiedFrom(const Target& t) {
         return t.depth ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
@@ -917,7 +1033,7 @@ private:
     void FillDepthConstants(const State& s, const DrawShaders& sh, const PsoKey& k, DrawConstants& c) const;
     void Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh, uint32_t w,
               uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3], const float p[8], float blend,
-              uint32_t samples);
+              uint32_t samples, ID3D12Resource* src3 = nullptr, DXGI_FORMAT fmt3 = kBgra);
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend,
                                             uint32_t samples);
     // Draw, in call order, each callee right after its caller
@@ -1071,6 +1187,7 @@ private:
         uint32_t shaders = 0, pipelines = 0, draws = 0;
     } later_;
     void StartWorkers();
+    void WarmEffects();
     void StopWorkers();
     void WorkerLoop();
     void TakeFinished();
@@ -1440,6 +1557,16 @@ private:
     bool track_states_ = false;
     ComPtr<ID3D12GraphicsCommandList> xl_;  // the copies and barriers between runs
     ComPtr<ID3D12Resource> out_;            // the frame drawn as shown
+    // HDR10 (CreateSwapChain): the back buffers' format, and the frame and the overlay drawn as for SDR before
+    // DrawFrame turns them into the HDR signal
+    bool hdr_ = false;
+    DXGI_FORMAT bb_fmt_ = DXGI_FORMAT_B8G8R8A8_UNORM;
+    // the window's display (DetectHdr): whether Windows shows it in HDR, its SDR white and peak in nits
+    HMONITOR hdr_mon_ = nullptr;
+    bool hdr_display_ = false;
+    float paper_nits_ = 200, peak_nits_ = 1000;
+    void DetectHdr();
+    bool EnsureHdrTargets();
     // Smaa's edges, weights and result at the frame's size, with their views and states
     struct SmaaTarget {
         ComPtr<ID3D12Resource> res;
@@ -1448,23 +1575,36 @@ private:
     };
     SmaaTarget smaa_[3];
     uint32_t smaa_w_ = 0, smaa_h_ = 0;
+    SmaaTarget hdr_img_, hdr_ui_;
+    uint32_t hdr_w_ = 0, hdr_h_ = 0;
     // ambient occlusion (AmbientOcclusion): the frame's scene, its target and depth and the draws that wrote depth
-    // there, done once a frame; the half size occlusion
+    // there (all, and since the last pass), the passes so far, done when the scene is over; the half size occlusion;
+    // the scene's depth as the last pass found it
     uint64_t ao_frame_ = UINT64_MAX;
     const Target* ao_rt_ = nullptr;
     const Target* ao_ds_ = nullptr;
-    uint32_t ao_draws_ = 0;
+    uint32_t ao_draws_ = 0, ao_new_ = 0, ao_passes_ = 0;
     bool ao_done_ = false;
-    SmaaTarget ao_;
+    SmaaTarget ao_prev_;
+    // the scene's view as its last depth writing draw had it: the projection's x and y scales, its z row's z and w,
+    // its w row's z, the viewport's depth scale and offset, the depth buffer's units
+    struct AoView {
+        float px, py, pz2, pz3, pw2, scale, offset, zscale;
+    };  // the world's: the first-person arms and gun have their own, in a part of the depth range (a smaller scale)
+    AoView ao_view_{};
+    bool ao_view_ok_ = false;
+    SmaaTarget ao_, ao_lin_, ao_albedo_, ao_blur_;  // the small targets: occlusion, distances, colours, blurred
     uint32_t ao_w_ = 0, ao_h_ = 0;
     void NoteAmbientOcclusion(const State& s, const PsoKey& k);
-    bool AmbientOcclusion(const State& s);
+    void FinishAmbientOcclusion();
+    bool AmbientOcclusion();
     D3D12_RESOURCE_STATES out_state_ = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // each frame shown, a set for each of the last three title frames: the presenter's queue holds up to three
     // images, from the frame before the last at most, and a set's not drawn again before it's all shown
     static constexpr uint32_t kShownSets = 3;
     ComPtr<ID3D12Resource> shown_[kShownSets][kInterpMax];
     uint32_t shown_set_ = 0, shown_w_ = 0, shown_h_ = 0, shown_n_ = 0;
+    DXGI_FORMAT shown_fmt_ = DXGI_FORMAT_UNKNOWN;
     double period_ms_ = 1000.0 / 60;  // between the title's frames, smoothed
     std::chrono::steady_clock::time_point last_present_{}, base_{};
     uint32_t refresh_ = 60;
@@ -1527,6 +1667,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     InterpFrameStart();
     StartPrebuild();
     StartWorkers();
+    WarmEffects();
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f x %.3f", width, height, bb_w_, bb_h_, scale_.x,
          scale_.y);
     return true;
@@ -1607,6 +1748,65 @@ void D3D12Backend::FitToAdapter(const DXGI_ADAPTER_DESC1& ad) {
     app::Save();
 }
 
+// Windows' SDR content brightness on monitor mon, in nits (its SDR white level, 1000 a 80 nits), 0 when unknown
+static float SdrWhiteNits(HMONITOR mon) {
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    UINT32 paths_n = 0, modes_n = 0;
+    if (!GetMonitorInfoW(mon, &info) ||
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths_n, &modes_n) != ERROR_SUCCESS)
+        return 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(paths_n);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modes_n);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths_n, paths.data(), &modes_n, modes.data(), nullptr) !=
+        ERROR_SUCCESS)
+        return 0;
+    for (UINT32 i = 0; i < paths_n; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+        if (std::wcscmp(source.viewGdiDeviceName, info.szDevice) != 0) continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = paths[i].targetInfo.adapterId;
+        white.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS) return 0;
+        return float(white.SDRWhiteLevel) * 0.08f;
+    }
+    return 0;
+}
+
+// the window's display: whether Windows shows it in HDR (its colour space PQ, BT.2020), its SDR white and its peak;
+// looked at again when the window moves to another display or Windows' HDR is switched (the factory no longer
+// current)
+void D3D12Backend::DetectHdr() {
+    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(app::Window()), MONITOR_DEFAULTTONEAREST);
+    if (mon == hdr_mon_ && factory_->IsCurrent()) return;
+    hdr_mon_ = mon;
+    ComPtr<IDXGIFactory4> fresh;
+    if (!factory_->IsCurrent() && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&fresh)))) factory_ = fresh;
+    DXGI_OUTPUT_DESC1 d{};
+    bool found = false;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT a = 0; !found && factory_->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        ComPtr<IDXGIOutput> output;
+        for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+            ComPtr<IDXGIOutput6> o6;
+            found = SUCCEEDED(output.As(&o6)) && SUCCEEDED(o6->GetDesc1(&d)) && d.Monitor == mon;
+        }
+    }
+    hdr_display_ = found && d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    peak_nits_ = found && d.MaxLuminance > 0 ? d.MaxLuminance : 1000.0f;
+    float white = SdrWhiteNits(mon);
+    paper_nits_ = white > 0 ? white : 200.0f;
+    LOGR("d3d12: display HDR %s, peak %.0f nits, SDR white %.0f nits", hdr_display_ ? "on" : "off", peak_nits_,
+         paper_nits_);
+}
+
 bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -1615,7 +1815,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = bb_w_;
     sd.Height = bb_h_;
-    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.Format = bb_fmt_;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = kFrames;
@@ -1628,6 +1828,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     }
     factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     sc1.As(&swap_);
+    DetectHdr();
     // the frames queued for the display at a time, waited for before each present (WaitLatency)
     latency_set_ = FrameLatency();
     swap_->SetMaximumFrameLatency(latency_set_);
@@ -2516,17 +2717,18 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
 
 void D3D12Backend::Pass(const char* hlsl, const char* entry, DXGI_FORMAT rtv, D3D12_CPU_DESCRIPTOR_HANDLE rh,
                         uint32_t w, uint32_t h, ID3D12Resource* const src[3], const DXGI_FORMAT fmt[3],
-                        const float p[8], float blend, uint32_t samples) {
+                        const float p[8], float blend, uint32_t samples, ID3D12Resource* src3, DXGI_FORMAT fmt3) {
     ID3D12PipelineState* pso = EnsurePassPipeline(hlsl, entry, rtv, blend, samples);
     if (!pso) return;
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = i < 3 && src[i] ? fmt[i] : kBgra;
+        ID3D12Resource* r = i < 3 ? src[i] : src3;
+        sv.Format = !r ? kBgra : i < 3 ? fmt[i] : fmt3;
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
-        dev_->CreateShaderResourceView(i < 3 ? src[i] : nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+        dev_->CreateShaderResourceView(r, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, p, 8 * sizeof(float));
@@ -2822,6 +3024,30 @@ void D3D12Backend::StartWorkers() {
     unsigned n = cores >= 8 ? 2 : 1;
     for (unsigned i = 0; i < n; i++) workers_.emplace_back([this] { WorkerLoop(); });
     LOGR("d3d12: %u threads make new shaders and pipelines, their draws left out meanwhile", n);
+}
+
+// The backend's own effects' shaders handed to the threads as the game starts, the ones not in shaders.bin: compiled
+// on the render thread when first drawn, a new or changed one held a frame up (the ambient occlusion's half a second as
+// a cutscene began). One still compiling when first needed is compiled there as before.
+void D3D12Backend::WarmEffects() {
+    if (workers_.empty()) return;
+    struct Entry {
+        std::string src;
+        const char* entry;
+        const char* profile;
+    };
+    const Entry kEntries[] = {
+        {kAoHlsl, "vs", "vs_5_0"},        {kAoHlsl, "lin", "ps_5_0"},         {kAoHlsl, "albedo", "ps_5_0"},
+        {kAoHlsl, "occlude", "ps_5_0"},   {kAoHlsl, "blur", "ps_5_0"},        {kAoHlsl, "apply", "ps_5_0"},
+        {kSmaaHlsl, "vs", "vs_5_0"},      {kSmaaHlsl, "edges", "ps_5_0"},     {kSmaaHlsl, "weights", "ps_5_0"},
+        {kSmaaHlsl, "blend", "ps_5_0"},   {kHdrHlsl, "vs", "vs_5_0"},         {kHdrHlsl, "pq", "ps_5_0"},
+        {kMaskedClearHlsl, "vs", "vs_5_0"}, {kMaskedClearHlsl, "psmain", "ps_5_0"},
+        {kDepthHlsl, "vs", "vs_5_0"},     {kDepthHlsl, "psmain", "ps_5_0"},
+        {std::string("#define MS\n") + kDepthHlsl, "vs", "vs_5_0"},
+        {std::string("#define MS\n") + kDepthHlsl, "psmain", "ps_5_0"},
+    };
+    uint64_t h;
+    for (const Entry& e : kEntries) Compile(e.src, e.entry, e.profile, h, true);
 }
 
 void D3D12Backend::StopWorkers() {
@@ -4183,8 +4409,14 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh) 
         auto to = [](int32_t e, float k) { return LONG(std::ceil((float(e) + 0.5f) * k - 0.5f)); };
         x0 = std::max(x0, from(int32_t(s.scissors[0]), sx));
         y0 = std::max(y0, from(int32_t(s.scissors[1]), sy));
-        x1 = std::min(x1, to(int32_t(s.scissors[2]), sx));
-        y1 = std::min(y1, to(int32_t(s.scissors[3]), sy));
+        // a scissor to the console's last column or row (0 0 639 479 over 640 by 480: the crane's view in Scotland
+        // and other overlays) leaves that column unpainted there, a line nobody sees; upscaled it is a strip of the
+        // scene beside a dark border. Such an edge reaches the target's
+        int32_t right = int32_t(s.scissors[2]), bottom = int32_t(s.scissors[3]);
+        if (right == int32_t(gw) - 1) right = int32_t(gw);
+        if (bottom == int32_t(gh) - 1) bottom = int32_t(gh);
+        x1 = std::min(x1, to(right, sx));
+        y1 = std::min(y1, to(bottom, sy));
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
@@ -4580,6 +4812,7 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
     }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureDepth(s, rt ? rt : FindTarget(s.rt, false)) : nullptr;
+    if (ds && ds == ao_ds_ && (flags & kClearZ)) FinishAmbientOcclusion();
     uint32_t gw;
     uint32_t gh;
     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
@@ -4791,7 +5024,10 @@ void D3D12Backend::ResizeSwap() {
     GetClientRect(hwnd, &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (w == bb_w_ && h == bb_h_) return;
+    // HDR10 where asked for and the display shows HDR, switched while playing
+    bool hdr = app::Get().hdr && hdr_display_;
+    g_hdr_output = hdr_ ? 1 : app::Get().hdr ? -1 : 0;
+    if (w == bb_w_ && h == bb_h_ && hdr == hdr_) return;
     DrainPresenter();
     std::lock_guard lock(swap_lock_);
     Flush();
@@ -4800,7 +5036,19 @@ void D3D12Backend::ResizeSwap() {
     }
     refresh_ = RefreshRate();
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, SwapFlags());
+    auto resize = [&](DXGI_FORMAT fmt, DXGI_COLOR_SPACE_TYPE space) {
+        UINT support = 0;
+        return SUCCEEDED(swap_->ResizeBuffers(kFrames, w, h, fmt, SwapFlags())) &&
+               SUCCEEDED(swap_->CheckColorSpaceSupport(space, &support)) &&
+               (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) && SUCCEEDED(swap_->SetColorSpace1(space));
+    };
+    bool was = hdr_;
+    hdr_ = hdr && resize(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+    if (!hdr_) resize(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    bb_fmt_ = hdr_ ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    g_hdr_output = hdr_ ? 1 : app::Get().hdr ? -1 : 0;
+    if (hdr_ != was || (hdr && !hdr_))
+        LOGR("d3d12: HDR10 %s", hdr_ ? "on" : hdr ? "asked for, but the swap chain can't show it: SDR" : "off");
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -4966,89 +5214,238 @@ ID3D12Resource* D3D12Backend::Smaa(Target& t) {
     return smaa_[2].res.Get();
 }
 
-// The scene's draws (depth tested and written, on the frame's first such target) are counted; the first draw on it
-// after 32 of them that writes no depth and tests none (the HUD, a glow, a screen pass) has the occlusion put in
-// before it, once a frame. The HUD and the effects laid over the scene are left out that way.
+// The scene's draws (depth tested and written, on the frame's first such target) are counted; once 32 of them are
+// in, the occlusion is put in before what is laid over them (a blended draw that writes no depth: a lamp's glow, an
+// explosion, smoke, the subtitles), for the scene drawn till then, and again before the next such layer for what the
+// scene has drawn since, up to kAoLayers times; then once more when the scene is over: before the first draw on it
+// that tests no depth (the HUD), the first draw elsewhere that reads it (the glow taken from the picture), a clear of
+// its depth (a cutscene's flares), or at the frame's end. Each pass darkens only where the depth has changed since the
+// one before (prev, in kAoHlsl), so a layer is not darkened by a later pass; put in once at the scene's end, the
+// occlusion darkened every glow, flame and line of text drawn among the scene's own draws. The view is the world's,
+// from the scene draws that use the whole depth range: the first-person arms and gun, drawn last, squeeze theirs into
+// its first 1/256, and with their view the world read as far away and its occlusion faded out.
+constexpr uint32_t kAoLayers = 4;
+// a layer's pass waits for this many scene draws since the last (a door, a lamp's base drawn among the glows): fewer
+// are left to the next pass, each pass a depth resolve and copy at full size (with MSAA 4 to 5 ms a frame at 4K)
+constexpr uint32_t kAoLayerDraws = 24;
+constexpr uint32_t kBlendZero = 0;  // D3DBLEND_ZERO
+
 void D3D12Backend::NoteAmbientOcclusion(const State& s, const PsoKey& k) {
     if (ao_frame_ != frame_) {
         ao_frame_ = frame_;
         ao_rt_ = ao_ds_ = nullptr;
-        ao_draws_ = 0;
+        ao_draws_ = ao_new_ = ao_passes_ = 0;
         ao_done_ = false;
+        ao_view_ok_ = false;
     }
     if (ao_done_ || !bound_rt_) return;
     bool always = !k.zen || Cmp(k.zfunc) == D3D12_COMPARISON_FUNC_ALWAYS;
     if (k.has_ds && k.zen && k.zwrite && !always && bound_ds_ && s.rs[kRsZEnable] == 1) {
         if (!ao_rt_) ao_rt_ = bound_rt_, ao_ds_ = bound_ds_;
-        if (bound_rt_ == ao_rt_ && bound_ds_ == ao_ds_) ao_draws_++;
+        if (bound_rt_ == ao_rt_ && bound_ds_ == ao_ds_) {
+            ao_draws_++;
+            ao_new_++;
+            const auto &px = s.vsc[60], &py = s.vsc[61], &pz = s.vsc[62], &pw = s.vsc[63];
+            float scale = s.vsc[58][2], offset = s.vsc[59][2];
+            // the projection the title keeps in c-36 to c-33 (TimeSplitters FP: rows of x, y, z and w) and the
+            // viewport's depth scale and offset (c-38.z, c-37.z)
+            bool shaped = px[0] != 0 && py[1] != 0 && pz[0] == 0 && pz[1] == 0 && pz[3] != 0 && pw[0] == 0 &&
+                          pw[1] == 0 && std::abs(std::abs(pw[2]) - 1) < 1e-3f && pw[3] == 0 && scale > 0 &&
+                          s.zscale > 0;
+            if (shaped && (!ao_view_ok_ || scale >= ao_view_.scale)) {
+                ao_view_ = {px[0], py[1], pz[2], pz[3], pw[2], scale, offset, s.zscale};
+                ao_view_ok_ = true;
+            }
+        }
         return;
     }
-    if (k.zwrite || !always || bound_rt_ != ao_rt_ || ao_draws_ < 32) return;
+    if (ao_draws_ < 32 || !ao_new_) return;
+    if (bound_rt_ == ao_rt_ && k.zen && !k.zwrite && k.blend && k.dst != kBlendZero && ao_passes_ < kAoLayers &&
+        ao_new_ >= kAoLayerDraws) {
+        if (AmbientOcclusion()) BindTargets(s);
+        return;
+    }
+    bool over = bound_rt_ == ao_rt_ && !k.zen;
+    if (!over && bound_rt_ != ao_rt_) {
+        const uint32_t mask = mem::kPhysicalSize - 1, scene = ao_rt_->data & mask;
+        for (uint32_t t : s.textures)
+            if (t && (kernel::R32(t + 4) & mask) == scene) over = true;  // a texture's data: a physical address
+    }
+    if (!over) return;
     ao_done_ = true;
-    if (AmbientOcclusion(s)) BindTargets(s);
+    if (AmbientOcclusion()) BindTargets(s);
 }
 
-// The projection the title keeps in c-36 to c-33 (TimeSplitters FP: rows of x, y, z and w) and the viewport's depth
-// scale and offset (c-38.z, c-37.z) give the view distance back from the depth buffer; a projection of another shape
-// leaves the picture as it is.
-bool D3D12Backend::AmbientOcclusion(const State& s) {
-    const auto& px = s.vsc[60];
-    const auto& py = s.vsc[61];
-    const auto& pz = s.vsc[62];
-    const auto& pw = s.vsc[63];
-    float scale = s.vsc[58][2], offset = s.vsc[59][2];
-    bool shaped = px[0] != 0 && py[1] != 0 && pz[0] == 0 && pz[1] == 0 && pz[3] != 0 && pw[0] == 0 && pw[1] == 0 &&
-                  std::abs(std::abs(pw[2]) - 1) < 1e-3f && pw[3] == 0 && scale > 0 && s.zscale > 0;
+// the scene's depth about to be cleared, or the frame over: the occlusion put in now when it is due
+void D3D12Backend::FinishAmbientOcclusion() {
+    if (!app::Get().ao || ao_frame_ != frame_ || ao_done_ || ao_draws_ < 32 || !ao_new_) return;
+    ao_done_ = true;
+    AmbientOcclusion();
+}
+
+// The view distance comes back from the depth buffer by the scene's projection (ao_view_); a projection of another
+// shape leaves the picture as it is.
+bool D3D12Backend::AmbientOcclusion() {
     static bool told = false;
-    if (!shaped) {
+    if (!ao_view_ok_) {
         if (!told) LOGR("d3d12: ambient occlusion off: the projection is not where it is looked for");
         told = true;
         return false;
     }
+    const AoView& v = ao_view_;
     Target& rt = *const_cast<Target*>(ao_rt_);
     Target& ds = *const_cast<Target*>(ao_ds_);
-    uint32_t aw = (rt.w + 1) / 2, ah = (rt.h + 1) / 2;
-    if (ao_w_ != aw || ao_h_ != ah || !ao_.res) {
-        if (ao_.res) CurrentFrame().garbage.push_back(std::move(ao_.res));
-        ao_.res.Reset();
-        if (ao_.view == UINT32_MAX) {
-            if (free_rtv_.empty()) return false;
-            ao_.view = free_rtv_.back();
-            free_rtv_.pop_back();
+    // the small size: a whole factor of the picture's, about 540 lines
+    uint32_t k = std::max(2u, (rt.h + 539) / 540);
+    uint32_t aw = (rt.w + k - 1) / k, ah = (rt.h + k - 1) / k;
+    struct Small {
+        SmaaTarget& t;
+        DXGI_FORMAT fmt;
+    };
+    const Small smalls[4] = {{ao_, DXGI_FORMAT_R8_UNORM},
+                             {ao_lin_, DXGI_FORMAT_R32_FLOAT},
+                             {ao_albedo_, DXGI_FORMAT_R8G8B8A8_UNORM},
+                             {ao_blur_, DXGI_FORMAT_R8G8B8A8_UNORM}};
+    if (ao_w_ != aw || ao_h_ != ah || !ao_.res || !ao_lin_.res || !ao_albedo_.res || !ao_blur_.res) {
+        for (const Small& m : smalls) {
+            if (m.t.res) CurrentFrame().garbage.push_back(std::move(m.t.res));
+            m.t.res.Reset();
+            if (m.t.view == UINT32_MAX) {
+                if (free_rtv_.empty()) return false;
+                m.t.view = free_rtv_.back();
+                free_rtv_.pop_back();
+            }
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC td = Texture2DDesc(m.fmt, aw, ah);
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE cv{};
+            cv.Format = td.Format;
+            m.t.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, m.t.state, &cv,
+                                                     IID_PPV_ARGS(&m.t.res)))) {
+                m.t.res.Reset();
+                return false;
+            }
+            dev_->CreateRenderTargetView(m.t.res.Get(), nullptr, Cpu(rtv_heap_.Get(), m.t.view, rtv_inc_));
         }
-        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_R8_UNORM, aw, ah);
-        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        D3D12_CLEAR_VALUE cv{};
-        cv.Format = td.Format;
-        ao_.state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_.state, &cv,
-                                                 IID_PPV_ARGS(&ao_.res)))) {
-            ao_.res.Reset();
-            return false;
-        }
-        dev_->CreateRenderTargetView(ao_.res.Get(), nullptr, Cpu(rtv_heap_.Get(), ao_.view, rtv_inc_));
         ao_w_ = aw;
         ao_h_ = ah;
-        LOGI("d3d12: ambient occlusion at %ux%u", aw, ah);
+        LOGI("d3d12: ambient occlusion at %ux%u (a %u-th of %ux%u)", aw, ah, k, rt.w, rt.h);
     }
-    if (cap_) fprintf(cap_, "%04u ambient occlusion %08X\n", cap_i_++, rt.data);
+    if (cap_) fprintf(cap_, "%04u ambient occlusion %08X pass %u\n", cap_i_++, rt.data, ao_passes_);
+    PassScope pass{*this, GpuPass::Effects};
     // z/w = (1 - d) * zscale / scale - offset / scale; the projection's z = a * view z + b, w = c * view z
-    const float p[8] = {offset / scale + pz[2] / pw[2], s.zscale / scale, pz[3],      1 / std::abs(px[0]),
-                        1 / std::abs(py[1]),            0.75f,           1.0f, float(app::Get().ao)};
+    // nearer than a quarter past the near plane: the arms and gun, which take their depth from the range's start
+    float arms = std::abs(v.pz3 * v.pw2 / v.pz2) * 1.25f;
+    const float p[8] = {v.offset / v.scale + v.pz2 / v.pw2, v.zscale / v.scale, v.pz3, 1 / std::abs(v.px),
+                        1 / std::abs(v.py),                float(k),            arms,  float(app::Get().ao)};
     D3D12_RESOURCE_STATES* st;
     ID3D12Resource* depth = Readable(ds, st);
     if (!depth) return false;
     Transition(depth, *st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    ID3D12Resource* in[3] = {depth, nullptr, nullptr};
-    const DXGI_FORMAT fmt[3] = {kDepthRead, DXGI_FORMAT_R8_UNORM, kBgra};
-    Transition(ao_.res.Get(), ao_.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Pass(kAoHlsl, "occlude", DXGI_FORMAT_R8_UNORM, Cpu(rtv_heap_.Get(), ao_.view, rtv_inc_), aw, ah, in, fmt, p, -1, 1);
-    Transition(ao_.res.Get(), ao_.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    in[1] = ao_.res.Get();
-    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Pass(kAoHlsl, "apply", rt.fmt, Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.w, rt.h, in, fmt, p, kPassMultiply,
-         Ms(rt));
+    // the depth as the last pass found it; none before the first, and all that is drawn has changed
+    D3D12_RESOURCE_DESC dd = depth->GetDesc();
+    if (ao_prev_.res) {
+        D3D12_RESOURCE_DESC pd = ao_prev_.res->GetDesc();
+        if (pd.Width != dd.Width || pd.Height != dd.Height || pd.Format != dd.Format) {
+            CurrentFrame().garbage.push_back(std::move(ao_prev_.res));
+            ao_prev_.res.Reset();
+        }
+    }
+    bool first = ao_passes_ == 0 || !ao_prev_.res;
+    ID3D12Resource* prev = first ? nullptr : ao_prev_.res.Get();
+    if (prev) Transition(prev, ao_prev_.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    auto at_small = [&](SmaaTarget& t, DXGI_FORMAT f, const char* entry, ID3D12Resource* const in[3],
+                     const DXGI_FORMAT fmt[3], ID3D12Resource* in3, DXGI_FORMAT fmt3) {
+        Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Pass(kAoHlsl, entry, f, Cpu(rtv_heap_.Get(), t.view, rtv_inc_), aw, ah, in, fmt, p, -1, 1, in3, fmt3);
+        Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    };
+    const DXGI_FORMAT none = kBgra;
+    {
+        ID3D12Resource* in[3] = {depth, nullptr, prev};
+        const DXGI_FORMAT fmt[3] = {kDepthRead, none, kDepthRead};
+        at_small(ao_lin_, DXGI_FORMAT_R32_FLOAT, "lin", in, fmt, nullptr, none);
+    }
+    // the colour of the surfaces, from the frame's first pass: the later layers add little to it, and each read of a
+    // multisampled picture resolved it whole first
+    if (ao_passes_ == 0) {
+        // the picture read where it is (resolved first when multisampled)
+        D3D12_RESOURCE_STATES* pst;
+        ID3D12Resource* picture = Readable(rt, pst);
+        if (!picture) return false;
+        Transition(picture, *pst, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        ID3D12Resource* in[3] = {nullptr, nullptr, nullptr};
+        const DXGI_FORMAT fmt[3] = {none, none, none};
+        at_small(ao_albedo_, DXGI_FORMAT_R8G8B8A8_UNORM, "albedo", in, fmt, picture, rt.fmt);
+    }
+    {
+        ID3D12Resource* in[3] = {nullptr, ao_lin_.res.Get(), nullptr};
+        const DXGI_FORMAT fmt[3] = {none, DXGI_FORMAT_R32_FLOAT, none};
+        at_small(ao_, DXGI_FORMAT_R8_UNORM, "occlude", in, fmt, nullptr, none);
+    }
+    {
+        ID3D12Resource* in[3] = {ao_albedo_.res.Get(), ao_lin_.res.Get(), nullptr};
+        const DXGI_FORMAT fmt[3] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, none};
+        at_small(ao_blur_, DXGI_FORMAT_R8G8B8A8_UNORM, "blur", in, fmt, ao_.res.Get(), DXGI_FORMAT_R8_UNORM);
+    }
+    {
+        ID3D12Resource* in[3] = {depth, ao_lin_.res.Get(), prev};
+        const DXGI_FORMAT fmt[3] = {kDepthRead, DXGI_FORMAT_R32_FLOAT, kDepthRead};
+        Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Pass(kAoHlsl, "apply", rt.fmt, Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.w, rt.h, in, fmt, p,
+             kPassMultiply, Ms(rt), ao_blur_.res.Get(), DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+    ao_passes_++;
+    ao_new_ = 0;
+    if (!ao_done_) {  // another pass may come: the depth kept for it
+        if (!ao_prev_.res) {
+            D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC td = dd;
+            td.SampleDesc.Count = 1;
+            td.Alignment = 0;
+            td.Flags = D3D12_RESOURCE_FLAG_NONE;
+            ao_prev_.state = D3D12_RESOURCE_STATE_COPY_DEST;
+            if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ao_prev_.state, nullptr,
+                                                     IID_PPV_ARGS(&ao_prev_.res)))) {
+                ao_prev_.res.Reset();
+                ao_done_ = true;  // without it a pass would darken the layers again: the rest of the scene goes without
+                return true;
+            }
+        }
+        Transition(depth, *st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(ao_prev_.res.Get(), ao_prev_.state, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl_->CopyResource(ao_prev_.res.Get(), depth);
+    }
+    return true;
+}
+
+// the SDR frame and overlay HDR10 draws from, at the back buffers' size
+bool D3D12Backend::EnsureHdrTargets() {
+    if (hdr_w_ == bb_w_ && hdr_h_ == bb_h_ && hdr_img_.res && hdr_ui_.res) return true;
+    for (SmaaTarget* s : {&hdr_img_, &hdr_ui_}) {
+        if (s->res) CurrentFrame().garbage.push_back(std::move(s->res));
+        s->res.Reset();
+        if (s->view == UINT32_MAX) {
+            if (free_rtv_.empty()) return false;
+            s->view = free_rtv_.back();
+            free_rtv_.pop_back();
+        }
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE cv{};
+        cv.Format = td.Format;
+        s->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, s->state, &cv,
+                                                 IID_PPV_ARGS(&s->res)))) {
+            s->res.Reset();
+            return false;
+        }
+        dev_->CreateRenderTargetView(s->res.Get(), nullptr, Cpu(rtv_heap_.Get(), s->view, rtv_inc_));
+    }
+    hdr_w_ = bb_w_;
+    hdr_h_ = bb_h_;
     return true;
 }
 
@@ -5074,11 +5471,40 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     Transition(img, st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
     float black[4] = {0, 0, 0, 1};
-    cl_->ClearRenderTargetView(rh, black, 0, nullptr);
-    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
-    bound_rt_ = bound_ds_ = nullptr;
-    if (t) BlitFrame(*t, rh);
-    RenderUi();
+    if (hdr_ && EnsureHdrTargets()) {
+        // drawn as for SDR, the overlay apart, then turned into the HDR signal
+        D3D12_CPU_DESCRIPTOR_HANDLE ih = Cpu(rtv_heap_.Get(), hdr_img_.view, rtv_inc_);
+        D3D12_CPU_DESCRIPTOR_HANDLE uh = Cpu(rtv_heap_.Get(), hdr_ui_.view, rtv_inc_);
+        float clear[4] = {0, 0, 0, 0};
+        Transition(hdr_img_.res.Get(), hdr_img_.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        Transition(hdr_ui_.res.Get(), hdr_ui_.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl_->ClearRenderTargetView(ih, black, 0, nullptr);
+        cl_->ClearRenderTargetView(uh, clear, 0, nullptr);
+        cl_->OMSetRenderTargets(1, &ih, FALSE, nullptr);
+        bound_rt_ = bound_ds_ = nullptr;
+        if (t) BlitFrame(*t, ih);
+        cl_->OMSetRenderTargets(1, &uh, FALSE, nullptr);
+        RenderUi();
+        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+        cl_->SetDescriptorHeaps(2, heaps);
+        cl_->SetGraphicsRootSignature(root_.Get());
+        binds_ = {};
+        Transition(hdr_img_.res.Get(), hdr_img_.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(hdr_ui_.res.Get(), hdr_ui_.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        const auto& a = app::Get();
+        // 0: Windows' SDR white, the display's peak
+        float white = a.hdr_white ? float(a.hdr_white) : paper_nits_, peak = a.hdr_peak ? float(a.hdr_peak) : peak_nits_;
+        const float p[8] = {white, std::max(peak, white), 0, 0, 0, 0, 0, 0};
+        ID3D12Resource* in[3] = {hdr_img_.res.Get(), hdr_ui_.res.Get(), nullptr};
+        const DXGI_FORMAT fmt[3] = {kBgra, kBgra, kBgra};
+        Pass(kHdrHlsl, "pq", bb_fmt_, rh, bb_w_, bb_h_, in, fmt, p, -1, 1);
+    } else {
+        cl_->ClearRenderTargetView(rh, black, 0, nullptr);
+        cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+        bound_rt_ = bound_ds_ = nullptr;
+        if (t) BlitFrame(*t, rh);
+        RenderUi();
+    }
     Transition(img, st, out ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_PRESENT);
 }
 
@@ -5227,6 +5653,30 @@ void D3D12Backend::FitRenderScale(double gpu_ms) {
     if (++fit_windows_ >= kWindows) done("room for 60 frames a second");
 }
 
+// MSAA lowered while the GPU has no room for it: 8x at 4K takes a GTX 1660 past a frame's time where Story's
+// effects lay many layers over the picture (a portal, smoke), each blended into every sample. Over each two seconds
+// of play the GPU's share of the time is taken; past kBusyShare the samples are halved, never under 2x. A menu clears
+// it (ApplySettings), as it makes the scene's targets anew anyway: the next level starts at the samples set again.
+void D3D12Backend::FitMsaa(double gpu_ms) {
+    auto now = std::chrono::steady_clock::now();
+    if (menu_mode_ || msaa_ <= 2 || busy_since_ == std::chrono::steady_clock::time_point{}) {
+        busy_since_ = now;
+        busy_ms_ = 0;
+        return;
+    }
+    busy_ms_ += gpu_ms;
+    double el = std::chrono::duration<double, std::milli>(now - busy_since_).count();
+    if (el < 2000) return;
+    constexpr double kBusyShare = 0.9;
+    if (busy_ms_ > el * kBusyShare) {
+        msaa_cap_ = msaa_ / 2;
+        LOGR("d3d12: the GPU was busy %.0f%% of the time at MSAA %ux: %ux until the next menu", busy_ms_ * 100 / el,
+             msaa_, msaa_cap_);
+    }
+    busy_since_ = now;
+    busy_ms_ = 0;
+}
+
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     if (f.fence && fence_->GetCompletedValue() < f.fence) {
@@ -5234,7 +5684,9 @@ void D3D12Backend::ResetFrame() {
         WaitFence(f.fence);
         g_perf.wait += PerfMs(perf_wait);
     }
-    FitRenderScale(fit_partial_ms_ + ReadGpuTime(f));
+    double gpu_ms = fit_partial_ms_ + ReadGpuTime(f);
+    FitRenderScale(gpu_ms);
+    FitMsaa(gpu_ms);
     fit_partial_ms_ = 0;
     f.alloc->Reset();
     f.xalloc->Reset();
@@ -5261,16 +5713,19 @@ void D3D12Backend::CountFps() {
 
 // The process's threads that used the most CPU since the last call, by name, each a percent of one core: which of them
 // keeps the processor busy (and warm) while the frame waits.
-void LogCpuByThread(double el_ms) {
+// guest, render: the title's threads together and the render thread, a percent of one core each
+std::string CpuByThread(double el_ms, double& total, size_t top, double* guest = nullptr, double* render = nullptr) {
     using Describe = HRESULT(WINAPI*)(HANDLE, PWSTR*);
     static Describe describe = reinterpret_cast<Describe>(
         reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
     static std::unordered_map<DWORD, uint64_t> last;  // a thread's kernel and user time, 100 ns
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
+    total = 0;
+    if (guest) *guest = 0;
+    if (render) *render = 0;
+    if (snap == INVALID_HANDLE_VALUE) return {};
     std::unordered_map<DWORD, uint64_t> now;
     std::vector<std::pair<double, std::string>> busy;
-    double total = 0;
     THREADENTRY32 te{sizeof(te)};
     for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
@@ -5284,14 +5739,16 @@ void LogCpuByThread(double el_ms) {
             auto it = last.find(te.th32ThreadID);
             double pct = it == last.end() ? 0 : double(t - it->second) / 1e4 / el_ms * 100;
             total += pct;
-            if (pct >= 2) {
+            if (pct >= 2 || ((guest || render) && pct > 0)) {
                 std::string name = "thread " + std::to_string(te.th32ThreadID);
                 PWSTR w = nullptr;
                 if (describe && SUCCEEDED(describe(h, &w)) && w) {
                     if (*w) name.assign(w, w + wcslen(w));  // the names are ASCII
                     LocalFree(w);
                 }
-                busy.push_back({pct, name});
+                if (guest && name.rfind("guest", 0) == 0) *guest += pct;
+                if (render && name == "render") *render += pct;
+                if (pct >= 2) busy.push_back({pct, name});
             }
         }
         CloseHandle(h);
@@ -5300,34 +5757,239 @@ void LogCpuByThread(double el_ms) {
     last = std::move(now);
     std::sort(busy.rbegin(), busy.rend());
     std::string split;
-    for (size_t i = 0; i < std::min<size_t>(busy.size(), 8); i++) {
+    for (size_t i = 0; i < std::min<size_t>(busy.size(), top); i++) {
         char part[96];
         std::snprintf(part, sizeof(part), "%s%s %.0f%%", split.empty() ? "" : ", ", busy[i].second.c_str(),
                       busy[i].first);
         split += part;
     }
+    return split;
+}
+
+void LogCpuByThread(double el_ms) {
+    double total;
+    std::string split = CpuByThread(el_ms, total, 8);
     LOGR("perf: cpu %.0f%% of a core in all | %s", total, split.c_str());
 }
 
-// true once a second, when it has logged
-bool LogPerf() {
+std::mutex g_stats_lock;
+FrameStats g_stats;
+
+// The threads' CPU, sampled every two seconds on a thread of its own while measuring: the snapshot of the system's
+// threads it walks takes tens of milliseconds, which on the render thread made a frame twice as long every half second
+// (the 1% slowest at 30 frames a second) and a frame rate measured above the cap, the time it took left out.
+struct CpuSample {
+    std::string top4, top8;  // the busiest threads, "name 30%, name 20%"
+    double total = 0, guest = 0, render = 0;
+};
+std::mutex g_cpu_lock;
+CpuSample g_cpu;
+
+CpuSample SampledCpu() {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            using Fn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+            if (Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
+                set(GetCurrentThread(), L"perf sampler");
+            auto last = PerfClock::now();
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                if (!diag::Perf()) continue;
+                CpuSample c;
+                c.top8 = CpuByThread(PerfMs(last), c.total, 8, &c.guest, &c.render);
+                last = PerfClock::now();
+                // the first four of the eight
+                size_t cut = 0;
+                for (int i = 0; i < 4 && cut != std::string::npos; i++) cut = c.top8.find(", ", cut ? cut + 2 : 0);
+                c.top4 = c.top8.substr(0, cut);
+                std::lock_guard lock(g_cpu_lock);
+                g_cpu = std::move(c);
+            }
+        }).detach();
+    });
+    std::lock_guard lock(g_cpu_lock);
+    return g_cpu;
+}
+
+// The performance log (diag::StatsLogFlag): the half second windows' numbers summed over ten seconds and written as one
+// line with the frame times' spread (the 1% slowest frames); a summary every five minutes; and each hitch (a frame
+// over 50 ms and two and a half times the average) as it happens, with what the frame did besides: shaders and
+// pipelines made, textures and targets made and uploaded, the render thread compiling, the title waiting on it.
+struct StatsWindow {
+    double ms = 0, frames = 0;
+    FrameStats sum;  // each field times the frames it stood for
+    std::vector<float> times;
+    uint32_t hitches = 0, stalls = 0;
+    double worst = 0;
+    void Add(const FrameStats& st, double n, double el) {
+        ms += el;
+        frames += n;
+        using F = double FrameStats::*;
+        for (F f : {&FrameStats::fps, &FrameStats::frame, &FrameStats::shown_fps, &FrameStats::game,
+                    &FrameStats::game_wait, &FrameStats::pace, &FrameStats::render, &FrameStats::draw, &FrameStats::compile,
+                    &FrameStats::copy, &FrameStats::present, &FrameStats::swap, &FrameStats::vsync, &FrameStats::gpu,
+                    &FrameStats::audio, &FrameStats::draws, &FrameStats::tris, &FrameStats::upload_mb,
+                    &FrameStats::tex_uploads})
+            sum.*f += st.*f * n;
+        for (size_t i = 0; i < std::size(sum.gpu_pass); i++) sum.gpu_pass[i] += st.gpu_pass[i] * n;
+        std::snprintf(sum.threads, sizeof(sum.threads), "%s", st.threads);
+        worst = std::max(worst, st.worst);
+    }
+    double Pct(double q) const {
+        if (times.empty()) return 0;
+        std::vector<float> t = times;
+        size_t k = std::min(t.size() - 1, size_t(double(t.size()) * q));
+        std::nth_element(t.begin(), t.begin() + ptrdiff_t(k), t.end());
+        return t[k];
+    }
+    void Log(const char* what) const {
+        if (frames <= 0) return;
+        auto avg = [&](double v) { return v / frames; };
+        const FrameStats& s = sum;
+        std::string gpu;
+        static const char* kNames[8] = {"scene-msaa", "scene", "small", "resolves", "copies", "final", "effects", "other"};
+        for (int i = 0; i < 8; i++)
+            if (avg(s.gpu_pass[i]) >= 0.01) {
+                char part[48];
+                std::snprintf(part, sizeof(part), " %s %.2f", kNames[i], avg(s.gpu_pass[i]));
+                gpu += part;
+            }
+        double p99 = Pct(0.99);
+        LOGR("stats %s: %.1f fps (1%% low %.1f, worst %.1f ms) %.2f ms a frame%s | cpu game %.2f (waits render %.2f, "
+             "cap %.2f) render "
+             "%.2f (draws %.2f copies %.2f shaders %.2f) present %.2f (vsync %.2f) | gpu %.2f:%s | %.0f draws %.0fk "
+             "tris %.2f MB up %.1f tex | audio %.1f%% | hitches %u stalls %u | %s",
+             what, frames * 1000.0 / ms, p99 > 0 ? 1000.0 / p99 : 0.0, worst, ms / frames,
+             avg(s.shown_fps) > frames * 1000.0 / ms * 1.2 ? " (interpolated)" : "", avg(s.game), avg(s.game_wait),
+             avg(s.pace), avg(s.render), avg(s.draw), avg(s.copy), avg(s.compile), avg(s.present), avg(s.vsync), avg(s.gpu),
+             gpu.c_str(), avg(s.draws), avg(s.tris) / 1000, avg(s.upload_mb), avg(s.tex_uploads), avg(s.audio),
+             hitches, stalls, s.threads);
+    }
+};
+StatsWindow g_stats_10s, g_stats_5min;
+
+// the frame just ended: a hitch logged, its time kept for the spread
+void StatsFrame(double ms, double avg) {
+    static uint64_t shaders, psos, newtex, targets, texups, texup_bytes, wait_ns;
+    static double compile;
+    static uint32_t logged_this_second;
+    static PerfClock::time_point second = PerfClock::now();
+    static bool started = false;
+    const Perf& p = g_perf;
+    if (!started) ms = 0, started = true;  // the time since the measurement before, not a frame
+    // g_perf starts over each half second: counted again from nothing then
+    if (p.shaders < shaders || p.texups < texups || p.compile < compile)
+        shaders = psos = newtex = targets = texups = texup_bytes = 0, compile = 0;
+    uint64_t wait = g_perf_wait_ns.load();
+    if (wait < wait_ns) wait_ns = 0;
+    if (PerfMs(second) > 1000.0) second = PerfClock::now(), logged_this_second = 0;
+    if (ms > 250.0) {
+        g_stats_10s.stalls++;
+        g_stats_5min.stalls++;
+        LOGR("stats: stall %.0f ms (a load, a pause, the window in the background, or a long hitch)", ms);
+    } else {
+        g_stats_10s.times.push_back(float(ms));
+        g_stats_5min.times.push_back(float(ms));
+        if (ms > 50.0 && ms > avg * 2.5) {
+            g_stats_10s.hitches++;
+            g_stats_5min.hitches++;
+            if (logged_this_second++ < 4)
+                LOGR("stats: hitch %.1f ms (frames %.1f) | new %llu shaders %llu pipelines %llu textures %llu targets, "
+                     "%llu uploads %.2f MB | render thread compiling %.1f ms | title waited %.1f ms",
+                     ms, avg, (unsigned long long)(p.shaders - shaders), (unsigned long long)(p.psos - psos),
+                     (unsigned long long)(p.newtex - newtex), (unsigned long long)(p.targets - targets),
+                     (unsigned long long)(p.texups - texups), double(p.texup_bytes - texup_bytes) / 1048576.0,
+                     p.compile - compile, double(wait - wait_ns) / 1e6);
+        }
+    }
+    shaders = p.shaders, psos = p.psos, newtex = p.newtex, targets = p.targets, texups = p.texups;
+    texup_bytes = p.texup_bytes, compile = p.compile, wait_ns = wait;
+}
+
+// true once a measured second has been logged (F9, XBE_PERF); the overlay's numbers published every half second
+// while measuring at all. shown_fps: the frames that reached the screen
+bool LogPerf(double shown_fps) {
     static PerfClock::time_point perf_start = PerfClock::now();
     static uint64_t perf_frames = 0;
+    static double worst = 0;
     // a measurement starting again later (F9) counts from now: no frame takes a quarter second, a gap that long is
     // the time between measurements
     static PerfClock::time_point last = PerfClock::now();
-    if (PerfMs(last) > 250.0) {
-        perf_start = PerfClock::now();
+    const PerfClock::time_point entry = PerfClock::now();
+    double since = PerfMs(last);
+    if (diag::StatsLogFlag().load(std::memory_order_relaxed))
+        StatsFrame(since, perf_frames ? PerfMs(perf_start) / double(perf_frames) : 16.7);
+    if (since > 250.0) {
+        perf_start = entry;
         perf_frames = 0;
+        worst = 0;
         g_perf = Perf{};
+        diag::g_pace_ns = 0;
+    } else {
+        worst = std::max(worst, since);
     }
-    last = PerfClock::now();
+    last = entry;
     perf_frames++;
     double el = PerfMs(perf_start);
-    if (el >= 1000.0) {
-        Perf& p = g_perf;
-        double n = double(perf_frames);
-        double host = p.draw + p.clear + p.copy + p.present + p.sync;
+    const bool log = diag::PerfLog();
+    if (el < (log ? 1000.0 : 500.0)) return false;
+    Perf& p = g_perf;
+    double n = double(perf_frames);
+    double host = p.draw + p.clear + p.copy + p.present + p.sync;
+    double capture_ns = double(g_perf_capture_ns.exchange(0)), wait_ns = double(g_perf_wait_ns.exchange(0));
+    double waits = double(g_perf_waits.exchange(0));
+    double kind_ns[6];
+    for (int i = 0; i < 6; i++) kind_ns[i] = double(g_perf_wait_kind_ns[i].exchange(0));
+    double sync_block = double(g_perf_sync_block.exchange(0)), sync_late = double(g_perf_sync_late.exchange(0));
+    double pace_ns = double(diag::g_pace_ns.exchange(0));
+    CpuSample cpu = SampledCpu();
+    double cpu_total = cpu.total;
+    const std::string& threads = log ? cpu.top8 : cpu.top4;
+    {
+        FrameStats st;
+        st.valid = true;
+        st.fps = n * 1000.0 / el;
+        st.frame = el / n;
+        st.worst = worst;
+        st.shown_fps = shown_fps;
+        st.game_wait = wait_ns / n / 1e6;
+        st.pace = pace_ns / n / 1e6;
+        st.game = cpu.guest / 100 * st.frame;
+        st.render = (host - p.present) / n;
+        st.draw = p.draw / n;
+        st.compile = p.compile / n;
+        st.copy = (p.clear + p.copy + p.sync) / n;
+        st.present = p.present / n;
+        st.swap = p.swap / n;
+        st.vsync = p.wait / n;
+        st.gpu = p.gpu / n;
+        for (size_t i = 0; i < std::size(st.gpu_pass); i++) st.gpu_pass[i] = p.pass_ms[i] / n;
+        st.audio = double(audio::g_mix_ns.exchange(0)) / 1e6 / el * 100;
+        st.draws = p.draws / n;
+        st.tris = p.verts / n / 3;
+        st.upload_mb = (p.upload + p.texup_bytes) / n / 1048576.0;
+        st.tex_uploads = p.texups / n;
+        st.shaders = double(p.shaders);
+        st.pipelines = double(p.psos);
+        std::snprintf(st.threads, sizeof(st.threads), "%s", cpu.top4.c_str());
+        if (diag::StatsLogFlag().load(std::memory_order_relaxed)) {
+            g_stats_10s.Add(st, n, el);
+            g_stats_5min.Add(st, n, el);
+            if (g_stats_10s.ms >= 10000.0) {
+                g_stats_10s.Log("10 s");
+                g_stats_10s = StatsWindow{};
+            }
+            if (g_stats_5min.ms >= 300000.0) {
+                g_stats_5min.Log("5 min");
+                g_stats_5min = StatsWindow{};
+            }
+        }
+        std::lock_guard lock(g_stats_lock);
+        g_stats = st;
+    }
+    if (log) {
         LOGR("perf: %.1f fps %.2f ms/frame | host %.2f (draw %.2f: assemble %.2f bind %.2f [check %.2f, upload %.2f] "
              "compile %.2f; clear %.2f copy %.2f sync %.2f present %.2f [swap %.2f wait %.2f]) other %.2f | gpu %.2f",
              n * 1000.0 / el, el / n, host / n, p.draw / n, p.assemble / n, p.bind / n, p.sig / n, p.texup / n,
@@ -5336,12 +5998,9 @@ bool LogPerf() {
         LOGR("perf: title thread per frame: recording %.2f ms, waiting %.2f ms (%.1f waits: read-back %.2f "
              "resource %.2f fence %.2f flush %.2f copy %.2f, next frame %.2f) | read-backs waited for: %.1f lock, "
              "%.1f NOOVERWRITE",
-             g_perf_capture_ns.exchange(0) / n / 1e6, g_perf_wait_ns.exchange(0) / n / 1e6,
-             g_perf_waits.exchange(0) / n, g_perf_wait_kind_ns[0].exchange(0) / n / 1e6,
-             g_perf_wait_kind_ns[1].exchange(0) / n / 1e6, g_perf_wait_kind_ns[2].exchange(0) / n / 1e6,
-             g_perf_wait_kind_ns[3].exchange(0) / n / 1e6, g_perf_wait_kind_ns[4].exchange(0) / n / 1e6,
-             g_perf_wait_kind_ns[5].exchange(0) / n / 1e6, g_perf_sync_block.exchange(0) / n,
-             g_perf_sync_late.exchange(0) / n);
+             capture_ns / n / 1e6, wait_ns / n / 1e6, waits / n, kind_ns[0] / n / 1e6, kind_ns[1] / n / 1e6,
+             kind_ns[2] / n / 1e6, kind_ns[3] / n / 1e6, kind_ns[4] / n / 1e6, kind_ns[5] / n / 1e6, sync_block / n,
+             sync_late / n);
         LOGR("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
              "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
@@ -5373,14 +6032,14 @@ bool LogPerf() {
             split += part;
         }
         if (!split.empty()) LOGR("perf: gpu ms per frame by target (draws): %s", split.c_str());
-        LogCpuByThread(el);
+        LOGR("perf: cpu %.0f%% of a core in all | %s", cpu_total, threads.c_str());
         diag::NoteSecond(n * 1000.0 / el, p.gpu / n);
-        g_perf = Perf{};
-        perf_start = PerfClock::now();
-        perf_frames = 0;
-        return true;
     }
-    return false;
+    g_perf = Perf{};
+    perf_start = entry;
+    perf_frames = 0;
+    worst = 0;
+    return log;
 }
 
 // the process's memory and the GPU's, with what the targets and textures hold of it
@@ -5439,6 +6098,7 @@ void D3D12Backend::Present(const Surface& front) {
         const char* s = std::getenv("XBE_CAPTURE_COUNT");
         return s ? std::max(std::atoi(s), 1) : 1;
     }();
+    FinishAmbientOcclusion();
     if (cap_) FinishCapture(front);
     if (capture_at >= 0 && capture_left > 0 &&
         std::chrono::duration<double>(std::chrono::steady_clock::now() - first_present).count() >= capture_at) {
@@ -5446,6 +6106,7 @@ void D3D12Backend::Present(const Surface& front) {
         g_capture = true;
     }
     if (!cap_ && g_capture.exchange(false) && CaptureOn()) StartCapture();
+    DetectHdr();
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
@@ -5509,7 +6170,7 @@ void D3D12Backend::Present(const Surface& front) {
     LogBuilds();
     ResetFrame();
     CountFps();
-    if (diag::Perf() && LogPerf()) LogMemory();
+    if (diag::Perf() && LogPerf(fps_)) LogMemory();
     ApplySettings();
     InterpFrameStart();
 }
@@ -5529,6 +6190,20 @@ void D3D12Backend::ApplySettings() {
         LOGR("d3d12: %u frame%s queued for the display", latency, latency > 1 ? "s" : "");
     }
     uint32_t msaa = SceneMsaa();
+    // a menu: layers over the whole picture, each written to every sample, cost 8x MSAA at 4K twice a level's frame
+    // and bring nothing an edge smoothing does not. Without MSAA from a menu's tick until play takes the mouse, or
+    // until no menu has ticked for kMenuMsaaMs: not between a menu's pages, whose turn ticks none for half a second,
+    // since each change makes the scene's targets anew
+    uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count()) + 1;
+    uint64_t since_menu = now_ms - app::g_menu_ms.load(), since_play = now_ms - app::g_play_ms.load();
+    bool menu = menu_mode_ ? since_menu < kMenuMsaaMs && !(since_play < kRecentTickMs && since_menu >= kRecentTickMs)
+                           : since_menu < kRecentTickMs;
+    if (msaa && menu != menu_mode_) LOGR("d3d12: MSAA %s for a menu", menu ? "off" : "back");
+    menu_mode_ = menu;
+    if (menu) msaa = 0, msaa_cap_ = 0;
+    if (msaa_cap_ && msaa > msaa_cap_) msaa = msaa_cap_;
     if (std::fabs(want.x - scale_.x) > 1e-4f || std::fabs(want.y - scale_.y) > 1e-4f || remake ||
         msaa != msaa_set_) {
         Flush();
@@ -6129,7 +6804,7 @@ D3D12_GPU_VIRTUAL_ADDRESS D3D12Backend::InterpConstants(const State& s) {
 // out_ and the images shown at the back buffers' size, for n frames shown a title frame
 bool D3D12Backend::EnsureInterp(uint32_t n) {
     if (!interp_arena_) return false;
-    if (out_ && shown_w_ == bb_w_ && shown_h_ == bb_h_ && shown_n_ >= n) return true;
+    if (out_ && shown_w_ == bb_w_ && shown_h_ == bb_h_ && shown_fmt_ == bb_fmt_ && shown_n_ >= n) return true;
     DrainPresenter();
     Frame& f = CurrentFrame();
     if (out_) f.garbage.push_back(out_);
@@ -6141,7 +6816,7 @@ bool D3D12Backend::EnsureInterp(uint32_t n) {
         }
     shown_n_ = 0;
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
-    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    D3D12_RESOURCE_DESC td = Texture2DDesc(bb_fmt_, bb_w_, bb_h_);
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
                                              IID_PPV_ARGS(&out_)))) {
@@ -6159,6 +6834,7 @@ bool D3D12Backend::EnsureInterp(uint32_t n) {
             }
     shown_w_ = bb_w_;
     shown_h_ = bb_h_;
+    shown_fmt_ = bb_fmt_;
     shown_n_ = n;
     return true;
 }
@@ -6485,5 +7161,10 @@ void D3D12Backend::PresenterLoop() {
 }
 
 std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+
+FrameStats Stats() {
+    std::lock_guard lock(g_stats_lock);
+    return g_stats;
+}
 
 }  // namespace gpu

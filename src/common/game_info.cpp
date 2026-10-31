@@ -26,6 +26,7 @@ void InstallBriefingTab();  // game/briefing.cpp
 void StartCoopOnline();     // game/coop_online.cpp
 void ApplyWeaponFov();      // game/fov.cpp
 void InitFont();            // game/ts2_style.cpp
+void InitSaveSignatures();  // game/save_signatures.cpp
 void StartDiscord();        // game/discord.cpp
 void StopDiscord();
 
@@ -105,6 +106,7 @@ void Loaded() {
     InstallBriefingTab();
     ApplyWeaponFov();
     InitFont();
+    InitSaveSignatures();
 }
 
 // the settings file's [keys] table and the Discord application
@@ -211,6 +213,8 @@ const app::GameInfo app::kGame = {
                 {"gyro_speed", nullptr, &game::Opt().gyro_speed},
                 {"hands", &game::Opt().hands, nullptr},
                 {"show_fps", &game::Opt().show_fps, nullptr},
+                {"show_stats", &game::Opt().show_stats, nullptr},
+                {"log_stats", &game::Opt().log_stats, nullptr},
                 {"rain", &game::Opt().rain, nullptr},
                 {"blood", &game::Opt().blood, nullptr},
                 {"font", nullptr, &game::Opt().font},

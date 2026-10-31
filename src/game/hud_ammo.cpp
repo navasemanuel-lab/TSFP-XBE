@@ -39,6 +39,7 @@
 namespace game {
 std::map<std::string, std::vector<uint8_t>> Ts2Files(const std::set<std::string>& names);  // game/ts2_style.cpp
 std::filesystem::path Ts2Root();                                                          // game/ts2_style.cpp
+void DrawTs1Ammo(X86Context& ctx);                                                        // game/hud_style.cpp
 }
 
 namespace {
@@ -200,6 +201,20 @@ void ReadTextures() {
          folder.c_str());
 }
 
+// TimeSplitters 1's icon of a sprite, in its HUD style: the mod ts1_hud's ts1/<sprite>.xbt (tools/ts1_hud.py)
+const std::vector<uint8_t>* Ts1Icon(const std::string& name) {
+    return game::Opt().hud_style == 2 ? game::mods::File("ts1/" + name + ".xbt") : nullptr;
+}
+
+// this game's ammunition as TimeSplitters 1's icon
+const std::map<uint32_t, uint32_t> kTs1Icons = {
+    {1, kSmall},   {2, kSmall},   {3, kSmall},          {4, kBig},     {5, kBig},     {6, kBig},     {7, kBig},
+    {8, kBig},     {9, kShell},   {10, kShell},         {12, kSmall},  {13, kBig},    {14, kBig},    {15, kBig},
+    {16, kRocket}, {17, kPlasma}, {18, kPlasma},        {19, kRocket}, {20, kHoming}, {21, kRocket}, {22, kGrenade},
+    {23, kGrenade}, {24, kBrick}, {25, kRemote},        {26, kTimed},  {27, kProx},   {28, kTnt},    {34, kSticky},
+    {35, kSmall},  {37, kRocket}, {40, kPlasmaMachine},
+};
+
 // the elements of an ammunition type put in place (TimeSplitters 2's, or the ones saved)
 void Write(uint32_t type, const uint32_t* words) {
     for (uint32_t i = 0; i < kElementCount * kElementWords; i++)
@@ -236,7 +251,9 @@ namespace game {
 // 2's HUD sprites read
 const std::vector<uint8_t>* Ts2Sprite(const std::string& path) {
     if (path.size() <= sizeof kGameFolder - 1 + 4 || path.compare(0, sizeof kGameFolder - 1, kGameFolder)) return nullptr;
-    auto it = g_textures.find(path.substr(sizeof kGameFolder - 1, path.size() - (sizeof kGameFolder - 1) - 4));
+    std::string name = path.substr(sizeof kGameFolder - 1, path.size() - (sizeof kGameFolder - 1) - 4);
+    if (Opt().hud_style == 2) return Ts1Icon(name);  // TimeSplitters 1's in its style
+    auto it = g_textures.find(name);
     if (it == g_textures.end()) return nullptr;
     // the boxes' ground: the final game's own is a pink one, TimeSplitters 2's white (tinted by the box's colour)
     if (it->first == SpriteName(kHudBack) && Opt().hud_style != 1) return nullptr;
@@ -244,6 +261,12 @@ const std::vector<uint8_t>* Ts2Sprite(const std::string& path) {
     if (served.insert(it->first).second)
         LOGR("hud: TimeSplitters 2's %s served (%zu bytes)", it->first.c_str(), it->second.size());
     return &it->second;
+}
+
+// hud_style.cpp: TimeSplitters 1's icon of an ammunition type when loaded, else none
+uint32_t Ts1AmmoSprite(uint32_t type) {
+    auto it = kTs1Icons.find(type);
+    return it != kTs1Icons.end() && Loaded(it->second) && Ts1Icon(SpriteName(it->second)) ? it->second : kNone;
 }
 
 // briefing.cpp: the boxes' ground, which the game's paks have too, read in place of theirs in TimeSplitters 2's style
@@ -270,7 +293,7 @@ X86_FUNC(sub_001B5C70) {
     ReadTextures();
     uint32_t eax = ctx.eax;
     for (uint32_t s = kFirstSprite; s <= kLastSprite; s++)
-        if (g_textures.count(SpriteName(s))) kernel::CallGuest(ctx, kLoadSprite, {s});
+        if (g_textures.count(SpriteName(s)) || Ts1Icon(SpriteName(s))) kernel::CallGuest(ctx, kLoadSprite, {s});
     for (uint32_t s : kEarlySprites)  // the circle only when TimeSplitters 2's was read
         if (s != kCircle || g_textures.count(SpriteName(s))) kernel::CallGuest(ctx, kLoadSprite, {s});
     ctx.eax = eax;
@@ -303,6 +326,10 @@ X86_FUNC(sub_00131B80) {
 // whose sprites are loaded
 X86_EXTERN_FUNC(__imp__sub_001334D0);
 X86_FUNC(sub_001334D0) {
+    if (game::Opt().hud_style == 2) {  // TimeSplitters 1's in its style (hud_style.cpp)
+        game::DrawTs1Ammo(ctx);
+        return kernel::Return(ctx, 0, 0);
+    }
     if (game::Opt().hud_style != 1 || !g_rounds) {
         __imp__sub_001334D0(ctx, base);
         return;

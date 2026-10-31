@@ -343,6 +343,14 @@ void Deactivate(Voice& v) {
 }
 
 void Mix(float* out, uint32_t frames) {
+    struct Timed {
+        std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+        ~Timed() {
+            audio::g_mix_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - t)
+                                            .count());
+        }
+    } timed;
     std::memset(out, 0, frames * 2 * sizeof(float));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (auto& [obj, v] : g_voices) {

@@ -228,6 +228,16 @@ const std::vector<uint8_t>* File(const std::string& path) {
     return &s.data;
 }
 
+std::vector<std::string> Paths(const std::string& prefix) {
+    std::lock_guard lock(g_lock);
+    if (!g_index.made) Make(g_index);
+    std::vector<std::string> out;
+    for (auto it = g_index.files.lower_bound(prefix); it != g_index.files.end() && !it->first.compare(0, prefix.size(), prefix);
+         ++it)
+        out.push_back(it->first);
+    return out;
+}
+
 void Read(const std::string& path, uint32_t buffer) {
     std::lock_guard lock(g_lock);
     auto s = g_served.find(Key(path));

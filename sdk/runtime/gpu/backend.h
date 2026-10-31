@@ -61,10 +61,33 @@ std::unique_ptr<Backend> CreateBackend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 
+// the HDR10 output as the swap chain was made: 0 off, 1 on, -1 asked for with the display's HDR off in Windows
+inline std::atomic<int> g_hdr_output{0};
+
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};
 inline std::atomic<uint64_t> g_perf_wait_kind_ns[6];  // read-back, resource, fence, flush, copy, next frame
 inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read-backs the title waited for, by cause
+
+// The performance overlay's numbers (panel), measured while diag::Perf() and published every half second: per frame
+// of the title, in milliseconds unless named otherwise
+struct FrameStats {
+    bool valid = false;
+    double fps = 0, frame = 0, worst = 0;  // the title's frames, the longest of them
+    double shown_fps = 0;                  // frames reaching the screen (more with frame interpolation)
+    double game = 0;                       // the title's threads busy (their CPU time): the game, recording its draws
+    double game_wait = 0;                  // the title's thread waiting on the render thread
+    double pace = 0;                       // the title's thread asleep in the frame cap
+    double render = 0, draw = 0, compile = 0, copy = 0;  // the render thread's work: in all, draws, shaders, copies
+    double present = 0, swap = 0, vsync = 0;             // handing the frame over: in all, the swap, waiting on it
+    double gpu = 0;
+    double gpu_pass[8] = {};  // scene, full, small, resolve, copy, final, effects, other
+    double audio = 0;         // the mixer, its share of one core in percent
+    double draws = 0, tris = 0, upload_mb = 0, tex_uploads = 0;
+    double shaders = 0, pipelines = 0;  // made this half second
+    char threads[160] = {};             // the busiest threads, percent of a core
+};
+FrameStats Stats();
 
 // visibility test results held at the highest of this many reports in a row: a title testing a sprite against the
 // depth it lies on (a sun on its sky) counts pixels that flicker on the host's rasterisation; 1 reports each as is

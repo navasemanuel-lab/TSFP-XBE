@@ -11,6 +11,7 @@
 #include <atomic>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
 
 #include <toml++/toml.hpp>
@@ -81,6 +82,11 @@ void Load() {
     s.frame_interp = t["frame_interp"].value_or(s.frame_interp);
     s.fog = t["fog"].value_or(s.fog);
     s.brightness = std::clamp<uint32_t>(t["brightness"].value_or(s.brightness), 50, 150);
+    s.hdr = t["hdr"].value_or(s.hdr);
+    s.hdr_white = t["hdr_white"].value_or(s.hdr_white);
+    if (s.hdr_white) s.hdr_white = std::clamp<uint32_t>(s.hdr_white, 80, 500);
+    s.hdr_peak = t["hdr_peak"].value_or(s.hdr_peak);
+    if (s.hdr_peak) s.hdr_peak = std::clamp<uint32_t>(s.hdr_peak, 200, 10000);
     std::string aspect = t["aspect_ratio"].value_or(std::string(kAspects[s.aspect]));
     for (uint32_t i = 0; i < kAspectCount; i++)
         if (aspect == kAspects[i]) s.aspect = i;
@@ -118,6 +124,9 @@ toml::table Table() {
                   {"msaa", int64_t(s.msaa)},
                   {"edge_smoothing", int64_t(s.edge_aa)},
                   {"brightness", int64_t(s.brightness)},
+                  {"hdr", s.hdr},
+                  {"hdr_white", int64_t(s.hdr_white)},
+                  {"hdr_peak", int64_t(s.hdr_peak)},
                   {"frame_interp", int64_t(s.frame_interp)},
                   {"fog", s.fog},
                   {"aspect_ratio", kAspects[std::min(s.aspect, kAspectCount - 1)]},
@@ -134,19 +143,39 @@ toml::table Table() {
     return t;
 }
 
+// the settings as last logged or saved: a save logs the lines that changed since, so a performance log shows what
+// each stretch of it was played with
+std::string g_logged;
+
+std::string Text() {
+    std::ostringstream text;
+    text << Table();
+    return text.str();
+}
+
 }  // namespace
 
 void Save() {
     // a co-op session plays on some of the host's settings (net/lockstep.h): this machine's file keeps its own
     if (lockstep::Active()) return;
+    std::string text = Text();
     std::ofstream f(File());
-    f << Table() << "\n";
+    f << text << "\n";
+    if (!g_logged.empty() && text != g_logged) {
+        std::set<std::string> before;
+        std::istringstream old(g_logged), now(text);
+        for (std::string line; std::getline(old, line);) before.insert(line);
+        std::string changed;
+        for (std::string line; std::getline(now, line);)
+            if (!line.empty() && line[0] != '[' && !before.count(line)) changed += (changed.empty() ? "" : ", ") + line;
+        if (!changed.empty()) LOGR("settings: %s", changed.c_str());
+    }
+    g_logged = text;
 }
 
 void LogSettings() {
-    std::ostringstream text;
-    text << Table();
-    std::istringstream lines(text.str());
+    g_logged = Text();
+    std::istringstream lines(g_logged);
     LOGR("Settings:");
     for (std::string line; std::getline(lines, line);)
         if (!line.empty()) LOGR("  %s", line.c_str());

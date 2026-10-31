@@ -37,6 +37,10 @@ struct Options {
     // the arms holding the weapon in the first person view (game/fov.cpp); off, the weapon alone, as in TimeSplitters 2
     bool hands = true;
     bool show_fps = false;
+    // the performance overlay (panel.cpp DrawStats): where each frame's time goes, the CPU's threads and the GPU's work
+    bool show_stats = false;
+    // the same into the log (d3d12.cpp StatsLog): every ten seconds, each hitch, a summary every five minutes
+    bool log_stats = false;
     // the rain falling around the view and running down the screen (game/weather.cpp)
     bool rain = true;
     // the blood (game/blood.cpp): the sprays from a hit and the splats and pools it leaves; in online co-op the host's

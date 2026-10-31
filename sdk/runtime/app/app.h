@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -41,6 +42,10 @@ struct Settings {
     // the picture's brightness, a percent: over 100 the darks and middle tones lifted, under it lowered, white and
     // black kept
     uint32_t brightness = 100;
+    // HDR10 output: the picture in the display's HDR signal (PQ, BT.2020) when Windows has HDR on for it; the game's
+    // white at hdr_white nits, its highlights stretched towards hdr_peak; 0: Windows' SDR white, the display's peak
+    bool hdr = false;
+    uint32_t hdr_white = 0, hdr_peak = 0;
     // the render scale has been fitted to the GPU's speed in play (FitRenderScale): no longer lowered by itself
     bool render_fitted = false;
     bool fresh = false;              // no settings file yet: the renderer fits the render scale to the GPU
@@ -53,6 +58,10 @@ struct Settings {
 };
 
 Settings& Get();
+// the last time (steady clock, ms) the game ran a menu that takes the pointer, a pause menu as the front end's, and
+// the last time the view took the mouse in play: the renderer draws the scene without MSAA from a menu until play
+inline std::atomic<uint64_t> g_menu_ms{0}, g_play_ms{0};
+
 void Load();
 void Save();
 void LogSettings();  // every setting, as the settings file has them

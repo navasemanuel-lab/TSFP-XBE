@@ -41,6 +41,7 @@ uint32_t StoryOnlinePlayerLimit();
 bool StoryOnlinePrepare(X86Context& ctx, uint32_t address);
 bool StoryOnlineActorActive(uint32_t caller, uint32_t index, uint32_t entity);
 bool StoryOnlineInLevel();
+void LogDamage(uint32_t record);  // game/ai_types.cpp
 }  // namespace game
 
 namespace {
@@ -814,6 +815,7 @@ X86_FUNC(sub_003559A0) {
 // host, and a bot's own shots, played here for the show, hurt no one
 X86_EXTERN_FUNC(__imp__sub_000BB6C0);
 X86_FUNC(sub_000BB6C0) {
+    game::LogDamage(R32(ctx.esp + 4));
     if (R32(kSessionUp) && R32(kRole) == 2 && MatchBots()) {
         uint32_t context = R32(ctx.esp + 4);
         bool remote = R32(kRemoteEvent) != 0;

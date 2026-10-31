@@ -6,6 +6,9 @@ This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/Xbox
 > [!NOTE]
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game (US Xbox release) to install or build.
 
+> [!IMPORTANT]
+> This is a fan project. It is not affiliated with, endorsed by or connected to Free Radical Design, Deep Silver, Plaion or Embracer Group. TimeSplitters and TimeSplitters: Future Perfect are trademarks of their respective owners, and all rights to the games belong to them.
+
 <p align="center">
   <img src="docs/screenshots/scotland-boat.webp" width="100%" alt="Scotland, the boat to the castle">
 </p>
@@ -32,6 +35,7 @@ Get `TSFP.zip` from the [latest release](https://github.com/navasemanuel-lab/TSF
 - **Render Scale** - Renders the game at 1% to 200% of the output resolution.
 - **Field of View** - Gameplay and first-person weapon field of view, also available as bars in the game's own Video Options.
 - **60 FPS** - The game runs at a steady 60 frames per second.
+- **HDR10** - On a display with HDR on in Windows, with Windows' SDR white and the display's peak, or your own.
 - **Brightness, V-Sync and FPS Counter**.
 - **Shader Cache** - Shaders and pipelines are cached and built ahead at start, so levels don't stutter the first time.
 
@@ -99,7 +103,8 @@ If something goes wrong, send the `logs` folder of both PCs.
 ## System Requirements
 ### Minimum
 - **OS**
-  - Windows 10 64-bit
+  - Windows 10 or Windows 11, 64-bit
+  - Linux and Steam Deck through Proton or Wine: not verified yet. Reports with the `logs` folder are welcome.
 - **CPU** with 2 cores and support for SSE4.2 and POPCNT
   - Intel Nehalem (Intel Core 1st Generation)
   - AMD Bulldozer (AMD FX series)
@@ -143,5 +148,6 @@ This port is developed with [Claude Code](https://claude.com/claude-code), Anthr
 - [lmplied/TSFPRecomp](https://github.com/lmplied/TSFPRecomp) for the lockstep co-op and in-game menu findings.
 - [TheDoffman/timesplitters-future-perfect-pc](https://github.com/TheDoffman/timesplitters-future-perfect-pc) for the System Link bot findings and the Discord presence.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for the overridable function layout and instruction hooks.
+- [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp) for the HDR10 output's approach (Windows' SDR white, highlights stretched by an inverse Reinhard).
 - [Input Prompts Pack](https://forums.unrealengine.com/t/free-assets-input-pack-with-over-1000-icons-for-pc-and-consoles/1215646) by Julio Cacko (CC0) for the controller button icons.
 - [Zydis](https://github.com/zyantific/zydis), [toml++](https://github.com/marzer/tomlplusplus), [Dear ImGui](https://github.com/ocornut/imgui) and [SDL](https://github.com/libsdl-org/SDL).

@@ -17,11 +17,14 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <functional>
 #include <utility>
 
 #include "common/options.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "kernel/memory.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -275,6 +278,10 @@ bool DrawEarlyArcs(X86Context& ctx) {
 
 }  // namespace game
 
+namespace {
+void FitRankValue(X86Context& ctx, const std::function<void()>& print);  // below, with the boxes
+}
+
 // Print(x, y, text, colour, shadow): the messages over the view of a kind 3 (0x14A280: "First kill: Monkey!" and the
 // like) in TimeSplitters 2's colours in the early style, its pale green on a dark green shadow (its 0xBC1C5), where the
 // final game's are white on a dark blue
@@ -286,7 +293,7 @@ X86_FUNC(sub_00041E30) {
         kernel::W32(ctx.esp + 16, kTs2Colour);
         kernel::W32(ctx.esp + 20, kTs2Shadow);
     }
-    __imp__sub_00041E30(ctx, base);
+    FitRankValue(ctx, [&] { __imp__sub_00041E30(ctx, base); });
 }
 
 // The teams' table (0x4D1E28, 0x14 each, team 0 none): +0 the team's tint 0xRRGGBBAA, +4 its icon, FP's skull
@@ -380,13 +387,26 @@ namespace {
 constexpr uint32_t kBoxPieces[6] = {0x12E67D, 0x12E6A3, 0x12E6C2, 0x12E6E8, 0x12E714, 0x12E735};  // the last always
 constexpr uint32_t kHudBack = 249, kHudBackTexels = 64 * 16;
 constexpr uint32_t kTs2Blue = 0x3C417F00;  // 0xRRGGBBAA, alpha left out
-// of the brackets' height and width: the label above them inside, and as wide as TimeSplitters 2's flat ovals
-constexpr float kRankAbove = 0.5f, kRankAside = 0.7f;
+// TimeSplitters 2's box is a flat oval twice as wide as it is tall (0xBD110: 80 by 40 with points, 56 by 40 a
+// clock), its label and value inside: here from a third of the brackets' height above them (the label's top) to a
+// fifth inside their bottom (under the value), twice as wide, kept inside the screen's edge, never narrower than them
+constexpr float kRankAbove = 0.3f, kRankBelow = 0.2f, kRankWide = 2.0f, kScreenWidth = 640, kScreenEdge = 4;
 bool g_rank_box = false, g_grey_box = false;
 constexpr uint32_t kGreyBoxes[2] = {0x12EDC5, 0x14F5CC};  // the box's returns to its clocks
 constexpr uint32_t kTs2Grey = 0x50505000;
 float g_box[4];  // the brackets' union so far
 uint32_t g_box_pieces = 0;
+float g_oval_half = 0;  // the half width of the oval drawn for the box, 0 before it
+// the box's value (the points, a challenge's medal...) at most this much of the oval's width
+constexpr float kValueWidth = 0.75f;
+constexpr uint32_t kTextHeight = 0x7E7264;                                      // at the scale set
+constexpr uint32_t kScaleX = 0x7E7270, kScaleY = 0x7E7280, kScaleZ = 0x7E7274;  // kTextScale's
+
+// a 0xRRGGBB00 tint as the quad's colour (0x1BA70 takes 0xAABBGGRR: its vertex program reads the bytes reversed),
+// the colour's alpha kept
+uint32_t QuadTint(uint32_t tint, uint32_t colour) {
+    return (colour & 0xFF000000) | ((tint >> 8) & 0xFF) << 16 | ((tint >> 16) & 0xFF) << 8 | tint >> 24;
+}
 
 // white, the final game's, kept to its alpha: tinted TimeSplitters 2's blue
 uint32_t Blue(uint32_t c) { return (c & 0xFFFFFF00) == 0x7F7F7F00 ? kTs2Blue | (c & 0xFF) : c; }
@@ -396,13 +416,18 @@ uint32_t Blue(uint32_t c) { return (c & 0xFFFFFF00) == 0x7F7F7F00 ? kTs2Blue | (
 // A challenge (mode [0x78AD20] 7) is played as a team game too, its player on yellow (Behead the Undead): grey there
 constexpr uint32_t kGameFlags = 0x7DE458, kViewPlayer = 0x7B0C7C, kPlayMode = 0x78AD20, kChallenge = 7;
 constexpr uint32_t kTs2Teams[5] = {kTs2Blue, 0x7F101000, 0x203F7F00, 0x7F7F0000, 0x107F1000};
-uint32_t RankTint() {
-    if (kernel::R32(kPlayMode) == kChallenge) return kTs2Grey;
+// the view's player's team, 1 to 4, in a team game; -1 in a challenge, 0 otherwise
+int ViewTeam() {
+    if (kernel::R32(kPlayMode) == kChallenge) return -1;
     uint32_t player = kernel::R32(kViewPlayer), body = player ? kernel::R32(player + 0x14) : 0;
     uint32_t chr = body ? kernel::R32(body + 0x7C) : 0;
-    if (!(kernel::R32(kGameFlags) & 1) || !chr) return kTs2Blue;
+    if (!(kernel::R32(kGameFlags) & 1) || !chr) return 0;
     uint32_t team = kernel::R32(chr + 0x84);
-    return team >= 1 && team <= 4 ? kTs2Teams[team] : kTs2Blue;
+    return team >= 1 && team <= 4 ? int(team) : 0;
+}
+uint32_t RankTint() {
+    int team = ViewTeam();
+    return team < 0 ? kTs2Grey : team ? kTs2Teams[team] : kTs2Blue;
 }
 }  // namespace
 
@@ -422,13 +447,16 @@ bool EarlyRankBox(X86Context& ctx) {
     }
     if (ret != kBoxPieces[5]) return true;
     float w = g_box[2] - g_box[0], h = g_box[3] - g_box[1];
+    float top = g_box[1] - h * kRankAbove, bottom = g_box[3] - h * kRankBelow, centre = (g_box[0] + g_box[2]) / 2;
+    float half = std::max(w / 2, std::min({(bottom - top) * kRankWide / 2, centre - kScreenEdge,
+                                           kScreenWidth - kScreenEdge - centre}));
+    g_oval_half = half;
     kernel::CallGuest(ctx, kSetSprite, {kernel::CallGuest(ctx, kSprite, {kHudBack})});
-    for (auto [at, v] : {std::pair{0u, U(g_box[0] - w * kRankAside)}, {4u, U(g_box[1] - h * kRankAbove)},
-                         {8u, U(g_box[2] + w * kRankAside)}, {12u, U(g_box[3])}, {16u, 0u}, {20u, 0u},
-                         {24u, kHudBackTexels}, {28u, kHudBackTexels}})
+    for (auto [at, v] : {std::pair{0u, U(centre - half)}, {4u, U(top)}, {8u, U(centre + half)}, {12u, U(bottom)},
+                         {16u, 0u}, {20u, 0u}, {24u, kHudBackTexels}, {28u, kHudBackTexels}})
         kernel::W32(a + at, v);
     uint32_t tint = g_grey_box ? kTs2Grey : RankTint();
-    for (uint32_t i = 0; i < 4; i++) kernel::W32(a + 32 + i * 4, tint | (kernel::R32(a + 32 + i * 4) & 0xFF));
+    for (uint32_t i = 0; i < 4; i++) kernel::W32(a + 32 + i * 4, QuadTint(tint, kernel::R32(a + 32 + i * 4)));
     static uint32_t logged = 0;
     if (logged != tint) {
         logged = tint;
@@ -439,17 +467,55 @@ bool EarlyRankBox(X86Context& ctx) {
 }
 }  // namespace game
 
-// the generic box (x, y, ...): its brackets gathered
+namespace {
+uint32_t DrawTs1Box(X86Context& ctx, bool grey);  // below, with TimeSplitters 1's bars
+}
+
+// the generic box (x, y, label, value, fade 0 to 1, ?, value's colour), its height returned: its brackets gathered;
+// TimeSplitters 1's box in its style
 X86_EXTERN_FUNC(__imp__sub_0012E3F0);
 X86_FUNC(sub_0012E3F0) {
     bool was = g_rank_box, was_grey = g_grey_box;
     uint32_t from = kernel::R32(ctx.esp);
+    if (game::Opt().hud_style == 2) {
+        bool grey = std::find(std::begin(kGreyBoxes), std::end(kGreyBoxes), from) != std::end(kGreyBoxes);
+        return kernel::Return(ctx, DrawTs1Box(ctx, grey), 0);
+    }
     g_rank_box = game::Opt().hud_style == 1;
     g_grey_box = std::find(std::begin(kGreyBoxes), std::end(kGreyBoxes), from) != std::end(kGreyBoxes);
     g_box_pieces = 0;
+    g_oval_half = 0;
     __imp__sub_0012E3F0(ctx, base);
     g_rank_box = was, g_grey_box = was_grey;
 }
+
+// the box's value, printed (x, y, text, colour, ...) by 0x42190 or 0x41E30 at the final game's size, centred under its
+// label: smaller when wider than TimeSplitters 2's oval lets it be, about the same centre
+namespace {
+constexpr uint32_t kValuePrinted[2] = {0x12E970, 0x12E9C6};
+void FitRankValue(X86Context& ctx, const std::function<void()>& print) {
+    uint32_t from = kernel::R32(ctx.esp);
+    if (!g_rank_box || !(g_oval_half > 0) ||
+        std::find(std::begin(kValuePrinted), std::end(kValuePrinted), from) == std::end(kValuePrinted))
+        return print();
+    uint32_t text = kernel::R32(ctx.esp + 12);
+    float x = F(ctx.esp + 4), y = F(ctx.esp + 8), h = F(kTextHeight);
+    kernel::CallGuest(ctx, kTextWidth, {text});
+    float w = float(ctx.st[ctx.top]);
+    x87_pop(ctx);
+    float most = g_oval_half * 2 * kValueWidth;
+    if (!(w > most)) return print();
+    float k = most / w, sx = F(kScaleX), sy = F(kScaleY), sz = F(kScaleZ);
+    kernel::W32(ctx.esp + 4, U(x + w * (1 - k) / 2));
+    kernel::W32(ctx.esp + 8, U(y + h * (1 - k) / 2));
+    kernel::CallGuest(ctx, kTextScale, {U(sx * k), U(sy * k), U(sz)});
+    print();
+    kernel::CallGuest(ctx, kTextScale, {U(sx), U(sy), U(sz)});
+}
+}  // namespace
+
+X86_EXTERN_FUNC(__imp__sub_00042190);
+X86_FUNC(sub_00042190) { FitRankValue(ctx, [&] { __imp__sub_00042190(ctx, base); }); }
 
 // the boxes' corner gradient: none under hudback
 X86_EXTERN_FUNC(__imp__sub_0012CC70);
@@ -458,9 +524,17 @@ X86_FUNC(sub_0012CC70) {
     __imp__sub_0012CC70(ctx, base);
 }
 
+namespace {
+void DrawTs1RadarCentre(X86Context& ctx);  // below, with TimeSplitters 1's radar
+}
+
 // a triangle fan of one colour (?, ?, colour 0xAABBGGRR, ...): the radar's centre
 X86_EXTERN_FUNC(__imp__sub_000167B0);
 X86_FUNC(sub_000167B0) {
+    if (kernel::R32(ctx.esp) == 0x1346A6 && game::Opt().hud_style == 2) {
+        DrawTs1RadarCentre(ctx);
+        return kernel::Return(ctx, 0, 0);
+    }
     if (kernel::R32(ctx.esp) == 0x1346A6 && game::Opt().hud_style == 1) {
         uint32_t c = kernel::R32(ctx.esp + 12);
         if ((c & 0xFFFFFF) == 0x7F7F7F) kernel::W32(ctx.esp + 12, (c & 0xFF000000) | 0x7F413C);
@@ -470,21 +544,21 @@ X86_FUNC(sub_000167B0) {
 
 // TimeSplitters 1's health and armour (the HUD style 2): two long bars across the top left corner, the armour's over
 // the health's, each lit from the left on a dark ground, measured from its screens (640 by 480): from 31 to 204
-// across and 13 to 30 down, then 33 to 50, of the view's height, so in any shape of screen. The armour is teal; the
-// health green, going through yellow to red as it falls. Read from the view's player: health [+0x1CC] of the most
+// across and 13 to 30 down, then 33 to 50, of the view's height, so in any shape of screen, each in a thin darker
+// frame. The armour is teal (7, 81, 81 of 255); the health green (2, 98, 2), going towards olive as it falls (31, 98,
+// 9 at 70%, 45, 102, 15 at 55%), on a dark grey (34). Read from the view's player: health [+0x1CC] of the most
 // [+0x1D8], a player's armour [[+0x7C]+0x78] of [[+0x7C]+0x7C], as 0x13A2C0 reads them
 namespace {
 constexpr float kTs1Left = 31.0f / 480, kTs1Width = 173.0f / 480, kTs1Top = 13.0f / 480, kTs1Height = 17.0f / 480,
-                kTs1Gap = 3.0f / 480;
-constexpr uint32_t kTs1Ground = 0x1A1D1E50, kTs1Armour = 0x0C2C346E;
+                kTs1Gap = 3.0f / 480, kTs1Frame = 0.75f / 480;
+constexpr uint32_t kTs1Ground = 0x11111170, kTs1Edge = 0x06050670, kTs1Armour = 0x0328287F;
 
 float Part(float now, float most) { return most > 0 && std::isfinite(now) ? std::clamp(now / most, 0.0f, 1.0f) : 0; }
 
 uint32_t Ts1Health(float part) {
-    // green 0x0C3D0C at full, yellow at half, red under it
-    float r = part > 0.5f ? 12 + (63 - 12) * (1 - part) * 2 : 63;
-    float g = part > 0.5f ? 61 : 61 * part * 2;
-    return uint32_t(r) << 24 | uint32_t(g) << 16 | 12u << 8 | 0x6E;
+    float lost = 1 - part;  // 0x7F full: half TimeSplitters 1's bytes
+    uint32_t r = uint32_t((2 + 97 * lost) / 2), g = uint32_t((98 + 4 * lost) / 2), b = uint32_t((2 + 28 * lost) / 2);
+    return r << 24 | g << 16 | b << 8 | 0x7F;
 }
 
 void DrawTs1Bars(X86Context& ctx) {
@@ -502,7 +576,8 @@ void DrawTs1Bars(X86Context& ctx) {
     kernel::CallGuest(ctx, kSetTexture, {0xFFFFFFFFu});
     kernel::CallGuest(ctx, kBlendMode, {1});
     for (int i = 0; i < 2; i++) {
-        float t = top + float(i) * (bh + h * kTs1Gap), part = i ? health : armour;
+        float t = top + float(i) * (bh + h * kTs1Gap), part = i ? health : armour, e = h * kTs1Frame;
+        Fill(ctx, left - e, t - e, right + e, t + bh + e, kTs1Edge);
         float lit = left + (right - left) * part;
         if (lit > left) Fill(ctx, left, t, lit, t + bh, i ? Ts1Health(part) : kTs1Armour);
         if (right > lit) Fill(ctx, lit, t, right, t + bh, kTs1Ground);
@@ -514,12 +589,88 @@ void DrawTs1Bars(X86Context& ctx) {
     }
 }
 
-// TimeSplitters 1's crosshair: a green cross, its four arms around a gap, of the view's height
+// TimeSplitters 1's boxes, under its bars from their left (its screens: Score, Rank, Time Left, Heads...): a label
+// strip of 20.5 lines, its name small and white, over a darker box of 26.5 for the value, large and white; 2 under
+// the bars, 4 between rows. A clock's and a challenge's are grey (label 62, value 34 of 255) and as wide as 70% of the
+// bars; the others in the player's team's colour (red without teams: label 127, 15, 17, value 70, 20, 22) and half
+// as wide, two to a row
+constexpr float kTs1BoxGap = 2.0f / 480, kTs1Label = 20.5f / 480, kTs1Value = 26.5f / 480, kTs1Row = 4.0f / 480,
+                kTs1Boxes = 0.70f, kTs1Apart = 2.0f / 480;
+constexpr uint32_t kTs1Labels[5] = {0x7F0F1100, 0x7F0F1100, 0x0F287F00, 0x7F6E0A00, 0x217E1F00};  // none, teams 1-4
+constexpr uint32_t kTs1Values[5] = {0x46141600, 0x46141600, 0x14204600, 0x463C0A00, 0x20462100};
+constexpr uint32_t kTs1GreyLabel = 0x3E3E3E00, kTs1GreyValue = 0x22222200;
+// the layout so far. The game stacks its boxes by a y it adds their heights to (the height returned: down to the
+// bottom of ours, so what it draws under them, the power-ups, comes under ours), a frame's growing; the score and the
+// rank share a row, the score sliding in from the left of the screen as it changes and pushing the rank right (the
+// HUD 0x14EF40: by x of the game's box width [0x4E68F4] * [0x47D688])
+float g_ts1_last_y = -1, g_ts1_top = 0;
+
+// text centred in (l, t, r, b), as tall as the box's share given, narrower when too wide
+void Ts1Text(X86Context& ctx, uint32_t text, float l, float t, float r, float b, float tall, uint32_t colour) {
+    if (!text || !(kernel::R16(text) & 0xFF)) return;
+    kernel::CallGuest(ctx, kTextScale, {U(1), U(1), U(1)});
+    float h1 = F(kTextHeight);
+    kernel::CallGuest(ctx, kTextWidth, {text});
+    float w1 = float(ctx.st[ctx.top]);
+    x87_pop(ctx);
+    if (!(h1 > 0) || !(w1 > 0)) return;
+    float k = std::min((b - t) * tall / h1, (r - l) * 0.9f / w1);
+    kernel::CallGuest(ctx, kTextScale, {U(k), U(k), U(1)});
+    float x = (l + r - w1 * k) / 2, y = (t + b - h1 * k) / 2;
+    kernel::CallGuest(ctx, kPrint, {U(x), U(y), text, colour, colour & 0xFF});
+    kernel::CallGuest(ctx, kTextScale, {U(1), U(1), U(1)});
+}
+
+uint32_t DrawTs1Box(X86Context& ctx, bool grey) {
+    uint32_t a = ctx.esp + 4, view = kernel::R32(kView);
+    if (!view) return 0;
+    float x = F(a), y = F(a + 4), fade = std::clamp(F(a + 16), 0.0f, 1.0f);
+    uint32_t label = kernel::R32(a + 8), value = kernel::R32(a + 12);
+    float h = float(int32_t(kernel::R32(view + 0x18)) - int32_t(kernel::R32(view + 0x14)));
+    float view_left = float(int32_t(kernel::R32(view)));
+    float left = view_left + h * kTs1Left, width = h * kTs1Width * kTs1Boxes;
+    float first = float(int32_t(kernel::R32(view + 0x14))) + h * (kTs1Top + 2 * kTs1Height + kTs1Gap + kTs1BoxGap);
+    if (g_ts1_last_y < 0 || y < g_ts1_last_y - 0.5f) {
+        g_ts1_top = first;  // a new frame (or view)
+    } else if (y > g_ts1_last_y + 0.5f) {
+        g_ts1_top = y + h * kTs1Row;  // a new row, under the last one's bottom returned
+    }
+    g_ts1_last_y = y;
+    int team = ViewTeam();
+    grey = grey || team < 0;
+    float rowh = h * (kTs1Label + kTs1Value), l = left, r = left + width;
+    if (!grey) {
+        constexpr uint32_t kBoxWidth = 0x4E68F4, kBoxShare = 0x47D688;
+        float half = (width - h * kTs1Apart) / 2, step = F(kBoxWidth) * F(kBoxShare);
+        float at = step > 0 ? (x - view_left - float(int32_t(kernel::R32(kMarginLeft)))) / step : 0;
+        l = left + at * (at < 0 ? half + h * kTs1Apart + left - view_left : half + h * kTs1Apart), r = l + half;
+        if (r <= view_left) return uint32_t(g_ts1_top + rowh - y);
+    }
+    float top = g_ts1_top, mid = top + h * kTs1Label, bottom = top + rowh;
+    uint32_t alpha = uint32_t(fade * 0x70);
+    uint32_t lc = grey ? kTs1GreyLabel : kTs1Labels[std::max(team, 0)];
+    uint32_t vc = grey ? kTs1GreyValue : kTs1Values[std::max(team, 0)];
+    kernel::CallGuest(ctx, kSetTexture, {0xFFFFFFFFu});
+    kernel::CallGuest(ctx, kBlendMode, {1});
+    Fill(ctx, l, top, r, mid, lc | alpha);
+    Fill(ctx, l, mid, r, bottom, vc | alpha);
+    uint32_t white = 0x7F7F7F00 | uint32_t(fade * 0x7F);
+    constexpr uint32_t kBoxStyle = 0x4E7278;  // the style the game's box prints in
+    uint32_t style = kernel::CallGuest(ctx, kTextStyle, {kLabelStyle});
+    Ts1Text(ctx, label, l, top, r, mid, 0.62f, white);
+    kernel::CallGuest(ctx, kTextStyle, {kernel::R32(kBoxStyle)});
+    Ts1Text(ctx, value, l, mid, r, bottom, 0.8f, white);
+    kernel::CallGuest(ctx, kTextStyle, {style});
+    return uint32_t(int32_t(bottom - y + 0.5f));
+}
+
+// TimeSplitters 1's crosshair: a green cross (3, 250, 3), its four thin arms of 12 around a gap of 5.5 from the
+// centre, about a pixel wide, of 480 lines of the view's height
 void DrawTs1Cross(X86Context& ctx, float cx, float cy) {
     uint32_t view = kernel::R32(kView);
     float h = view ? float(int32_t(kernel::R32(view + 0x18)) - int32_t(kernel::R32(view + 0x14))) : 480;
-    float k = h / 480, arm = 7 * k, gap = 3 * k, half = std::max(1.0f, 1.0f * k);
-    constexpr uint32_t kGreen = 0x147F1464;
+    float k = h / 480, arm = 12 * k, gap = 5.5f * k, half = 0.6f * k;
+    constexpr uint32_t kGreen = 0x017D017F;
     kernel::CallGuest(ctx, kSetTexture, {0xFFFFFFFFu});
     kernel::CallGuest(ctx, kBlendMode, {1});
     Fill(ctx, cx - gap - arm, cy - half, cx - gap, cy + half, kGreen);
@@ -527,7 +678,147 @@ void DrawTs1Cross(X86Context& ctx, float cx, float cy) {
     Fill(ctx, cx - half, cy - gap - arm, cx + half, cy - gap, kGreen);
     Fill(ctx, cx - half, cy + gap, cx + half, cy + gap + arm, kGreen);
 }
+
+// TimeSplitters 1's radar: a green disc (0, 100, 0) fading out from its centre to its edge, no ring, in place of the
+// ring hudradar (a quad from 0x13427A); its blips drawn over it as they are
+float g_radar[2];  // the disc's centre, for the view's own blip
+
+void DrawTs1Radar(X86Context& ctx, float cx, float cy, float radius) {
+    g_radar[0] = cx, g_radar[1] = cy;
+    constexpr int kSides = 32;
+    constexpr uint32_t kCentre = 0x0032007F, kEdge = 0x00320000;
+    float z = F(0x475DBC);
+    kernel::CallGuest(ctx, kSetTexture, {0xFFFFFFFFu});
+    kernel::CallGuest(ctx, kBlendMode, {1});
+    kernel::CallGuest(ctx, kBegin, {3, 9, 0x31, uint32_t(kSides * 3)});
+    uint32_t p = kernel::R32(kVertex);
+    auto put = [&](float x, float y, uint32_t c) {
+        for (uint32_t v : {U(x), U(y), U(z), c}) {
+            kernel::W32(p, v);
+            p += 4;
+        }
+    };
+    for (int i = 0; i < kSides; i++) {
+        float a0 = float(i) * 6.2831853f / kSides, a1 = float(i + 1) * 6.2831853f / kSides;
+        put(cx, cy, kCentre);
+        put(cx + radius * std::cos(a0), cy + radius * std::sin(a0), kEdge);
+        put(cx + radius * std::cos(a1), cy + radius * std::sin(a1), kEdge);
+    }
+    kernel::W32(kVertex, p);
+    kernel::CallGuest(ctx, kEnd, {});
+}
+
+// the view's own place on it: a white dot (205, 221, 204) of 3, in place of the final game's arrow
+void DrawTs1RadarCentre(X86Context& ctx) {
+    constexpr float kHalf = 1.5f;
+    kernel::CallGuest(ctx, kSetTexture, {0xFFFFFFFFu});
+    Fill(ctx, g_radar[0] - kHalf, g_radar[1] - kHalf, g_radar[0] + kHalf, g_radar[1] + kHalf, 0x666E667F);
+}
 }  // namespace
+
+// TimeSplitters 1's ammunition (its screens): at the bottom corner of the hand's side the rounds in the clip, the
+// ammunition's icon and the rounds left, in large white numbers 22 lines tall of the view's 480, 6.5 over its bottom
+// and 20 in from its side, 14 between the numbers and the icon (at TimeSplitters 2's icons' size). Drawn in place of
+// the game's (0x1334D0: character, 0, gun slot, hand's state, side 1 right or else left), from what it reads: the gun
+// [state+0x30] in the
+// guns' table, its ammunition [gun+0x14] and clip's size [gun+0x18], the clip's rounds [state+type*2+0x38] (a word),
+// the rounds left [character+type*2+0x61E] (a word)
+namespace {
+constexpr uint32_t kGuns = 0x4F9BAC, kGunSize = 0x29C, kAmmoTypes = 0x4EA3FC, kAmmoTypeSize = 0xE0;
+constexpr uint32_t kSprites = 0x4D2D58, kSpriteSize = 0x18, kTextures = 0x4B85C8, kQuad = 0x1BA70;
+constexpr uint32_t kAmmoStyle = 4;  // the game's for one or two players
+constexpr float kAmmoTall = 22.0f / 480, kAmmoBottom = 6.5f / 480, kAmmoSide = 20.0f / 480, kAmmoGap = 14.0f / 480,
+                kAmmoIcon = 0.8f;  // of its texture's size, times the HUD's scale [0x4E68F0]: as TimeSplitters 2's icons
+constexpr uint32_t kHudScale = 0x4E68F0;
+
+// a number printed with its left (or right) at x and its bottom at y, as tall as given; its width returned
+float Ts1Number(X86Context& ctx, int value, float x, float y, float tall, bool right) {
+    static uint32_t text = 0;
+    if (!text && !(text = mem::AllocSystem(16))) return 0;
+    std::snprintf(static_cast<char*>(kernel::HostPtr(text)), 16, "%d", value);
+    kernel::CallGuest(ctx, kTextScale, {U(1), U(1), U(1)});
+    float h1 = F(kTextHeight);
+    kernel::CallGuest(ctx, kTextWidth, {text});
+    float w1 = float(ctx.st[ctx.top]);
+    x87_pop(ctx);
+    if (!(h1 > 0)) return 0;
+    float k = tall / h1, w = w1 * k;
+    kernel::CallGuest(ctx, kTextScale, {U(k), U(k), U(1)});
+    kernel::CallGuest(ctx, kPrint, {U(right ? x - w : x), U(y - tall), text, 0x7F7F7F7Fu, 0x0000007Fu});
+    kernel::CallGuest(ctx, kTextScale, {U(1), U(1), U(1)});
+    return w;
+}
+
+}  // namespace
+namespace game {
+uint32_t Ts1AmmoSprite(uint32_t type);  // hud_ammo.cpp
+}
+namespace {
+
+// the ammunition's icon with its left (or right) at x and its middle at y, TimeSplitters 1's when it has one; its
+// width returned
+float Ts1AmmoIcon(X86Context& ctx, uint32_t type, float x, float y, bool right) {
+    uint32_t sprite = game::Ts1AmmoSprite(type);
+    if (sprite == 0xFFFFFFFF) sprite = kernel::R32(kAmmoTypes + type * kAmmoTypeSize);
+    if (sprite >= 0x3FF || kernel::R32(kSprites + sprite * kSpriteSize + 0xC) == 0xFFFFFFFF) return 0;
+    uint32_t texture = kernel::CallGuest(ctx, kSprite, {sprite});
+    uint32_t t = kernel::R32(kernel::R32(kTextures)) + texture * 0x34;
+    uint32_t tw = kernel::R16(t + 0x26), th = kernel::R16(t + 0x2A);
+    if (!tw || !th) return 0;
+    float k = kAmmoIcon * (F(kHudScale) > 0 ? F(kHudScale) : 1.0f), tall = float(th) * k, w = float(tw) * k;
+    float l = right ? x - w : x;
+    y += tall / 2;
+    kernel::CallGuest(ctx, kSetSprite, {texture});
+    kernel::CallGuest(ctx, kQuad, {U(l), U(y - tall), U(l + w), U(y), 0, 0, tw * 16, th * 16, 0x7F7F7F7Fu,
+                                   0x7F7F7F7Fu, 0x7F7F7F7Fu, 0x7F7F7F7Fu});
+    return w;
+}
+}  // namespace
+
+namespace game {
+// hud_ammo.cpp's hook of 0x1334D0, in TimeSplitters 1's style
+void DrawTs1Ammo(X86Context& ctx) {
+    uint32_t a = ctx.esp + 4, view = kernel::R32(kView);
+    uint32_t chr = kernel::R32(a), state = kernel::R32(a + 12), side = kernel::R32(a + 16);
+    bool right = side == 1;
+    if (!view || !state) return;
+    uint32_t gun = kernel::R32(state + 0x30);
+    if (gun == 0xFFFFFFFF) return;
+    gun = kernel::R32(kGuns) + gun * kGunSize;
+    uint32_t type = kernel::R32(gun + 0x14);
+    if (!type || type >= 0x2C) return;
+    int clip = int16_t(kernel::R16(state + type * 2 + 0x38)), size = int32_t(kernel::R32(gun + 0x18));
+    int left = chr ? int16_t(kernel::R16(chr + type * 2 + 0x61E)) : 0;
+    float h = float(int32_t(kernel::R32(view + 0x18)) - int32_t(kernel::R32(view + 0x14)));
+    float bottom = float(int32_t(kernel::R32(view + 0x18))) - h * kAmmoBottom;
+    // side 2 (a third gun, the game's 0x1335E8) a row higher while the left hand holds one (0x1B6C50)
+    constexpr uint32_t kHolds = 0x1B6C50, kPlayer = 0x7B0C7C;
+    uint32_t player = kernel::R32(kPlayer), body = player ? kernel::R32(player + 0x14) : 0;
+    uint32_t hand = body ? kernel::R32(body + 0x7C) : 0;
+    if (side == 2 && hand && kernel::CallGuest(ctx, kHolds, {player + 0x184, hand + 0xA4}))
+        bottom -= h * (kAmmoTall + kAmmoBottom);
+    float x = right ? float(int32_t(kernel::R32(view + 4))) - h * kAmmoSide : float(int32_t(kernel::R32(view))) + h * kAmmoSide;
+    float dir = right ? -1.0f : 1.0f, gap = h * kAmmoGap;
+    uint32_t style = kernel::CallGuest(ctx, kTextStyle, {kAmmoStyle});
+    kernel::CallGuest(ctx, kBlendMode, {1});
+    // printed from the side inwards: on the right the rounds left first
+    auto number = [&](int v) { x += dir * (Ts1Number(ctx, v, x, bottom, h * kAmmoTall, right) + gap); };
+    auto icon = [&] {
+        float w = Ts1AmmoIcon(ctx, type, x, bottom - h * kAmmoTall / 2, right);
+        if (w > 0) x += dir * (w + gap);
+    };
+    if (right) {
+        number(left);
+        icon();
+        if (size > 0) number(clip);
+    } else {
+        if (size > 0) number(clip);
+        icon();
+        number(left);
+    }
+    kernel::CallGuest(ctx, kTextStyle, {style});
+}
+}  // namespace game
 
 // a view's HUD: no bars drawn yet; in TimeSplitters 1's style its bars after it
 X86_EXTERN_FUNC(__imp__sub_0014CC80);
@@ -546,6 +837,12 @@ X86_FUNC(sub_0001B7B0) {
     if (from == kFromCrosshair && game::Opt().hud_style == 2) {
         uint32_t a = ctx.esp + 4;
         DrawTs1Cross(ctx, (F(a) + F(a + 8)) * 0.5f, (F(a + 4) + F(a + 12)) * 0.5f);
+        return kernel::Return(ctx, 0, 0);
+    }
+    if ((from == kFromRadar || from == kFromPulse) && game::Opt().hud_style == 2) {
+        uint32_t a = ctx.esp + 4;
+        if (from == kFromRadar)
+            DrawTs1Radar(ctx, (F(a) + F(a + 8)) * 0.5f, (F(a + 4) + F(a + 12)) * 0.5f, std::abs(F(a + 8) - F(a)) * 0.5f);
         return kernel::Return(ctx, 0, 0);
     }
     if ((from == kFromRadar || from == kFromPulse) && game::Opt().hud_style == 1)

@@ -206,6 +206,7 @@ void SetPanel(bool open) {
 void Aiming() {
     if (!Play()) RefreshCursor();
     g_aim_ms = NowMs();
+    app::g_play_ms = g_aim_ms.load();
 }
 
 bool TakeMotion(float& dx, float& dy) {
@@ -247,6 +248,7 @@ int WheelButton() {
 void InMenu() {
     if (NowMs() - g_menu_ms >= kRecentMs) RefreshCursor();
     g_menu_ms = NowMs();
+    app::g_menu_ms = g_menu_ms.load();
 }
 
 bool MenuMode() { return NowMs() - g_menu_ms < kRecentMs && !Play(); }
