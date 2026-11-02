@@ -62,7 +62,6 @@ Get `TSFP.zip` from the [latest release](https://github.com/navasemanuel-lab/TSF
 - **Discord Rich Presence**.
 
 ### Online
-- **Online Story Co-op** - Two PCs play Story together in lockstep, each player full screen. Start it from **Story → Host Online Story** and **Story → Join Online Story**.
 - **System Link over the Internet** - The game's own System Link (Arcade, up to 16 players) over a LAN, a VPN (Radmin VPN, ZeroTier, Hamachi), or hosted through one player's game with no VPN.
 - **System Link Bots** - The host's Bot Set fills the empty places.
 
@@ -85,18 +84,11 @@ The early content comes from the TimeSplitters 2 and Future Perfect preview disc
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to show a splash screen at launch.
 
 ## Online Play
-### Online Story Co-op
-Both players need the **same `TSFP.exe`** and the same US game files.
-1. **Player 2** writes player 1's address in F1 → Co-op → **Host's address**.
-2. **Player 1** chooses **Story → Host Online Story**. The game restarts and waits.
-3. **Player 2** chooses **Story → Join Online Story**.
-4. Choose **Story**, then **2 players**.
-
-Over the internet, player 1 opens UDP port **7777**, or both players join the same VPN. From the command line: `TSFP.exe --host [port]` or `TSFP.exe --join <address>[:port]`.
-
 ### System Link
-- **Hosted:** one player chooses F1 → System Link → **Host System Link over the internet**. The game tries to open UDP port **7778** by UPnP. The others write the host's address and choose **Join a System Link host**.
+- **Hosted:** in `settings.toml`, the host sets `link = "host"`, and the others set `link = "join"` and `link_address = "<host address>"`. The game tries to open UDP port **7778** by UPnP. The others need nothing open.
 - **VPN:** everyone joins the same VPN and uses System Link as on a LAN.
+
+Online Story Co-op has been removed: it was experimental and never worked well enough. Story co-op is split screen on one PC.
 
 If something goes wrong, send the `logs` folder of both PCs.
 
@@ -145,7 +137,7 @@ This port is developed with [Claude Code](https://claude.com/claude-code), Anthr
 
 ## Credits
 - [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp), the recompiler and runtime this port is built on.
-- [lmplied/TSFPRecomp](https://github.com/lmplied/TSFPRecomp) for the lockstep co-op and in-game menu findings.
+- [lmplied/TSFPRecomp](https://github.com/lmplied/TSFPRecomp) for the in-game menu findings.
 - [TheDoffman/timesplitters-future-perfect-pc](https://github.com/TheDoffman/timesplitters-future-perfect-pc) for the System Link bot findings and the Discord presence.
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) for the overridable function layout and instruction hooks.
 - [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp) for the HDR10 output's approach (Windows' SDR white, highlights stretched by an inverse Reinhard).
