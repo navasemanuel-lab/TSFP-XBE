@@ -1,5 +1,5 @@
 # TimeSplitters: Future Perfect - XBE Recomp
-An unofficial native PC port of the original Xbox version of TimeSplitters: Future Perfect, with extended graphics options, keyboard and mouse support, online Story co-op, restored early content and other enhancements.
+An unofficial native PC port of the original Xbox version of TimeSplitters: Future Perfect, with extended graphics options, keyboard and mouse support, System Link play, restored early content and other enhancements.
 
 This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool.
 
