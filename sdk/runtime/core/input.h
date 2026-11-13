@@ -16,9 +16,8 @@ enum class Family : uint8_t { None, Xbox, PlayStation4, PlayStation5, Switch, Ot
 Family PadFamily(int port);
 
 void Init();  // window thread, before boot
-// the controller on that port, then GameInfo::pad; in a co-op session the frame's controls of that port's player
+// the controller on that port, then GameInfo::pad
 Pad Poll(int port);
-Pad PollLocal(int port);  // this machine's, also in a session
 Pad Read(int port);  // the controller alone, without GameInfo::pad
 void Rumble(int port, uint16_t left, uint16_t right);
 // the controller's turn since the last take in degrees, left and up positive, held at any tilt; false without a gyro

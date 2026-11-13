@@ -8,8 +8,8 @@
 #include <map>
 #include <vector>
 
+#include "app/app.h"
 #include "audio/audio.h"
-#include "net/lockstep.h"
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -124,9 +124,8 @@ struct Voice {
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
     bool placed = false;  // the title gave it a position
-    bool muted = false;   // started while audio::MutePlays was on
     // the levels the last mix ended on: the next one glides from them, so a sound that moves or turns does not click
-    float last[2][2] = {};
+    float last[2][6] = {};  // by voice channel and speaker (audio::g_channels of them)
     bool mixed = false;
     // ADPCM block cache
     int64_t block = -1;
@@ -145,7 +144,6 @@ float g_rolloff = 1.0f;  // IDirectSound_SetRolloffFactor: 0 none, 1 the real wo
 // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
 std::deque<Done> g_done;
 std::condition_variable_any g_done_cv;
-thread_local bool t_mute_plays = false;
 thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushed them, once g_lock is let go
 std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
 bool g_started = false;
@@ -237,13 +235,13 @@ bool TraceLevels(uint32_t obj) {
     return true;
 }
 
-// gain of voice channel c on host left and right. A hardware voice holds two channels and owns a run of slots,
-// which alternate left and right.
-void Levels(Voice& v, float g[2][2]) {
-    if (v.muted) {
-        g[0][0] = g[0][1] = g[1][0] = g[1][1] = 0;
-        return;
-    }
+// gain of voice channel c on each host speaker: left and right, or with 5.1 out also the centre, the sub and the back
+// pair (the console's first six bins, in the same order). A hardware voice holds two channels and owns a run of
+// slots, which alternate left and right.
+void Levels(Voice& v, float g[2][6]) {
+    for (int c = 0; c < 2; c++)
+        for (int e = 0; e < 6; e++) g[c][e] = 0;
+    const bool surround = audio::g_channels == 6;
     static const uint8_t kFront[2] = {0, 1};
     const uint8_t* bin = v.nbins ? v.bin : kFront;
     uint32_t n = v.nbins ? v.nbins : 2, voices = (std::max<uint32_t>(v.channels, 1) - 1) / 2 + 1;
@@ -251,10 +249,17 @@ void Levels(Voice& v, float g[2][2]) {
     bool speakers = false;
     for (uint32_t s = 0; s < n; s++) speakers |= bin[s] < 10 && bin[s] != 3;
     for (uint32_t c = 0; c < 2; c++) {
-        g[c][0] = g[c][1] = 0;
         for (uint32_t s = c; c < v.channels && s < per && s < n; s += step) {
             uint32_t b = bin[s];
-            if (speakers && (b == 3 || b > 9)) continue;  // sub and effect sends
+            if (speakers && b > 9) continue;  // effect sends
+            if (speakers && surround) {
+                // the console's own speakers; its back crosstalk (6 to 9) to the back pair at -3 dB
+                float x = Db(v.bin_mb[b]) * v.volume * v.headroom;
+                if (b < 6) g[c][b] += x;
+                else g[c][4 + (b & 1)] += x * 0.707f;
+                continue;
+            }
+            if (speakers && b == 3) continue;  // the sub, on stereo
             float x = Db(v.bin_mb[b]) * v.volume * v.headroom * StereoFold(b);
             // even bins are left, odd right, 2 is the centre
             bool left = !speakers || b == 2 || !(b & 1);
@@ -330,10 +335,22 @@ void Levels(Voice& v, float g[2][2]) {
     constexpr float kFarEar = 0.75f;
     float width = std::clamp(dist - 1.0f, 0.0f, 1.0f);
     float pan = dist > 1e-3f && !v.stream ? std::clamp(side / dist, -1.0f, 1.0f) * width * (1.0f - kFarEar) : 0.0f;
-    for (int c = 0; c < 2; c++) {
-        g[c][0] *= att * std::min(1.0f, 1.0f - pan);
-        g[c][1] *= att * std::min(1.0f, 1.0f + pan);
-    }
+    for (int c = 0; c < 2; c++)
+        for (int e = 0; e < 6; e++) {
+            bool left = e == 0 || e == 4, right = e == 1 || e == 5;
+            g[c][e] *= att * (left ? std::min(1.0f, 1.0f - pan) : right ? std::min(1.0f, 1.0f + pan) : 1.0f);
+        }
+    // 5.1: an effect behind the listener moves from the front pair to the back one, the power kept, by how far
+    // behind it is; as the lean, from one to two units away (the player's own sounds stay in front)
+    if (!surround || v.stream || dist <= 1e-3f) return;
+    float ahead = rel ? d[2] : d[0] * g_front[0] + d[1] * g_front[1] + d[2] * g_front[2];
+    float back = std::clamp(-ahead / dist, 0.0f, 1.0f) * width;
+    float keep = std::sqrt(1.0f - back), move = std::sqrt(back);
+    for (int c = 0; c < 2; c++)
+        for (int e = 0; e < 2; e++) {
+            g[c][4 + e] += g[c][e] * move;
+            g[c][e] *= keep;
+        }
 }
 
 // a stream goes quiet: the synch hold ends, a started one loses its pause as well
@@ -351,18 +368,19 @@ void Mix(float* out, uint32_t frames) {
                                             .count());
         }
     } timed;
-    std::memset(out, 0, frames * 2 * sizeof(float));
+    const uint32_t n = audio::g_channels;
+    std::memset(out, 0, frames * n * sizeof(float));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing)) {
             v.mixed = false;
             continue;
         }
-        float g[2][2], from[2][2], dg[2][2];
+        float g[2][6], from[2][6], dg[2][6];
         Levels(v, g);
         // from the last mix's levels to these across the block; a voice just started takes them at once
         for (int c = 0; c < 2; c++)
-            for (int e = 0; e < 2; e++) {
+            for (uint32_t e = 0; e < n; e++) {
                 from[c][e] = v.mixed ? v.last[c][e] : g[c][e];
                 dg[c][e] = (g[c][e] - from[c][e]) / float(std::max<uint32_t>(frames, 1));
                 v.last[c][e] = g[c][e];
@@ -423,35 +441,31 @@ void Mix(float* out, uint32_t frames) {
             a += (a1 - a) * t;
             b += (b1 - b) * t;
             float k = float(i + 1);
-            out[i * 2] += a * (from[0][0] + dg[0][0] * k) + b * (from[1][0] + dg[1][0] * k);
-            out[i * 2 + 1] += a * (from[0][1] + dg[0][1] * k) + b * (from[1][1] + dg[1][1] * k);
+            for (uint32_t e = 0; e < n; e++)
+                out[i * n + e] += a * (from[0][e] + dg[0][e] * k) + b * (from[1][e] + dg[1][e] * k);
             v.pos += step;
         }
     }
     // the mix a little under full scale, its peaks bent round instead of cut off: many sounds at once (a fight, every
     // cry of every character) no longer clip into a harsh buzz
     constexpr float kMaster = 0.7f, kKnee = 0.6f;
-    for (uint32_t i = 0; i < frames * 2; i++) {
+    for (uint32_t i = 0; i < frames * n; i++) {
         float x = out[i] * kMaster, a = std::abs(x);
         if (a > kKnee) x = std::copysign(kKnee + (1 - kKnee) * std::tanh((a - kKnee) / (1 - kKnee)), x);
         out[i] = x;
     }
+    // mono: both speakers play the two sides together
+    if (audio::g_mono && n == 2)
+        for (uint32_t i = 0; i < frames; i++) out[i * 2] = out[i * 2 + 1] = 0.5f * (out[i * 2] + out[i * 2 + 1]);
 }
 
-// A co-op session (net/lockstep.h) mixes the sound a frame at a time as the game's frame starts (MixFrame): what a
-// voice has played, its packets done and whether it stopped follow the game's frames, the same on both machines,
-// never the host's playback. The output plays what was mixed, from a ring of at most kRingMax frames.
-std::mutex g_ring_lock;
-std::deque<float> g_ring;
-constexpr size_t kRingMax = audio::kRate / 10;
-
 void Render(float* out, uint32_t frames) {
-    if (!lockstep::Active()) return Mix(out, frames);
-    std::lock_guard lock(g_ring_lock);
-    uint32_t n = uint32_t(std::min<size_t>(frames, g_ring.size() / 2));
-    std::copy(g_ring.begin(), g_ring.begin() + n * 2, out);
-    g_ring.erase(g_ring.begin(), g_ring.begin() + n * 2);
-    std::fill(out + n * 2, out + frames * 2, 0.0f);
+    const uint32_t ch = audio::g_channels;
+    // the game paused in the background (app::Pace): silence, the voices keep their place
+    if (app::g_paused) return std::fill(out, out + frames * ch, 0.0f);
+    Mix(out, frames);
+    // in the background with the game still running: the voices go on, nothing is heard
+    if (app::g_background) std::fill(out, out + frames * ch, 0.0f);
 }
 
 int64_t NowMs() {
@@ -475,8 +489,7 @@ void Start() {
             {
                 std::unique_lock<std::recursive_mutex> lock(g_lock);
                 g_done_cv.wait_for(lock, std::chrono::milliseconds(50));
-                // in a co-op session the callbacks run only in DirectSoundDoWork, whose time is the game's
-                if (NowMs() - g_pumped < kPumpMs || lockstep::Active()) continue;
+                if (NowMs() - g_pumped < kPumpMs) continue;
                 done.assign(g_done.begin(), g_done.end());
                 g_done.clear();
             }
@@ -771,7 +784,6 @@ BUFFER(SetBufferData, 3) {
 BUFFER(Play, 4) {
     if (TraceAudio()) LOGR("audio: play %08X flags %X bytes %u data %08X", v.obj, a[3], v.bytes, v.data);
     v.playing = true;
-    v.muted = t_mute_plays;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
@@ -1066,22 +1078,3 @@ STREAM(SetPosition, 5) {
 }
 STREAM(SetVelocity, 5) { return 0; }
 STREAM(SetI3DL2Source, 3) { return 0; }
-
-namespace dsound {
-
-// a co-op session's frame of sound (net/lockstep.h), mixed as the game's frame starts
-void MixFrame(uint32_t samples) {
-    std::vector<float> buf(samples * 2);
-    Mix(buf.data(), samples);
-    std::lock_guard lock(g_ring_lock);
-    g_ring.insert(g_ring.end(), buf.begin(), buf.end());
-    if (g_ring.size() > kRingMax * 2) g_ring.erase(g_ring.begin(), g_ring.begin() + (g_ring.size() - kRingMax * 2));
-}
-
-}  // namespace dsound
-
-namespace audio {
-
-void MutePlays(bool on) { t_mute_plays = on; }
-
-}  // namespace audio

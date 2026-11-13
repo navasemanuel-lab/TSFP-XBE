@@ -199,8 +199,12 @@ std::vector<uint32_t> AdapterBroadcasts() {
     return found;
 }
 
-// a VPN adapter's address (Radmin VPN, ZeroTier, Hamachi), 0 for none up
+// a VPN adapter's address (Radmin VPN, ZeroTier, Hamachi, Tailscale, NetBird), 0 for none up; the adapters it saw are
+// logged when they change
 uint32_t VpnAddress() {
+    static std::string seen;
+    std::string report;
+    uint32_t found = 0;
     ULONG size = 32 << 10;
     std::vector<uint8_t> buf(size);
     if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
@@ -211,15 +215,23 @@ uint32_t VpnAddress() {
         std::wstring name = std::wstring(a->Description ? a->Description : L"") + L" " +
                             (a->FriendlyName ? a->FriendlyName : L"");
         std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
-        if (name.find(L"radmin") == std::wstring::npos && name.find(L"zerotier") == std::wstring::npos &&
-            name.find(L"hamachi") == std::wstring::npos)
+        static const wchar_t* const kVpns[] = {L"radmin", L"zerotier", L"hamachi", L"tailscale", L"netbird"};
+        if (std::none_of(std::begin(kVpns), std::end(kVpns), [&](const wchar_t* v) { return name.find(v) != std::wstring::npos; }))
             continue;
         for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
             auto* in = reinterpret_cast<sockaddr_in*>(u->Address.lpSockaddr);
-            if (in->sin_family == AF_INET && (in->sin_addr.s_addr & 0xFFFF) != 0xFEA9) return in->sin_addr.s_addr;
+            if (in->sin_family != AF_INET || (in->sin_addr.s_addr & 0xFFFF) == 0xFEA9) continue;
+            char n[128];
+            WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName ? a->FriendlyName : L"", -1, n, sizeof n, nullptr, nullptr);
+            report += std::string(n) + " " + Ip(in->sin_addr.s_addr) + "; ";
+            if (!found) found = in->sin_addr.s_addr;  // the first adapter listed wins
         }
     }
-    return 0;
+    if (report != seen) {
+        seen = report;
+        LOGR("xnet: VPN adapters up: %s", report.empty() ? "none" : report.c_str());
+    }
+    return found;
 }
 
 // hosted link
@@ -670,9 +682,26 @@ bool TryComplete(PendingRecv& p) {
     return true;
 }
 
+// a VPN that came up (or went down) after the game started: this game's address follows it, as long as the title
+// is not on a hosted link or a loopback instance
+void FollowVpn() {
+    static uint64_t looked = 0;
+    uint64_t now = GetTickCount64();
+    if (now - looked < 3000) return;
+    looked = now;
+    if (g_instance || g_link != Link::Off) return;
+    g_route = PrimaryAddress();
+    uint32_t vpn = VpnAddress(), want = vpn ? vpn : g_route;
+    if (want && want != g_local) {
+        LOGR("xnet: address now %s %s (was %s)", vpn ? "VPN" : "LAN", Ip(want).c_str(), Ip(g_local).c_str());
+        g_local = want;
+    }
+}
+
 void Pump() {
     uint64_t hello = 0;
     for (;;) {
+        FollowVpn();
         fd_set set;
         FD_ZERO(&set);
         {
@@ -1054,7 +1083,10 @@ HLE_STDCALL(accept, 3) {
             if (a[1]) std::memcpy(HostPtr(a[1]), &from, sizeof(from));
             if (a[2]) W32(a[2], sizeof(from));
             LOGI("xnet: accept %X from %s", a[0], Addr(from).c_str());
-            return AddSocket(s, false);
+            uint32_t id = AddSocket(s, false);
+            std::lock_guard<std::mutex> lock(g_lock);
+            g_sockets[id].nonblocking = k.nonblocking;  // as Winsock's accept: the listener's mode
+            return id;
         }
         int e = WSAGetLastError();
         if (e != WSAEWOULDBLOCK || k.nonblocking) return Fail(e);

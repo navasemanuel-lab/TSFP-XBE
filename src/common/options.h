@@ -8,6 +8,9 @@ namespace game {
 
 struct Options {
     bool fps_60 = true;       // the game's own 30 fps cap lifted: its logic counts vertical blanks, so it keeps its speed
+    // frames a second (game/native_clock.cpp), each stepping the game by its real fraction of a 60 Hz tick: 0 the
+    // game's own 60, 1 the display's refresh, 30 to 999 that rate, 1000 without a limit
+    uint32_t fps_target = 0;
     bool skip_intros = true;  // the EA and Free Radical logo movies at boot
     bool skip_any_cutscene = true;  // Start or A skips the cutscenes the game would not let go before they were seen
     // a loading screen ends when the load does, not when its bar, paced for the console's disc, has filled
@@ -36,6 +39,9 @@ struct Options {
     uint32_t gyro_speed = 200;
     // the arms holding the weapon in the first person view (game/fov.cpp); off, the weapon alone, as in TimeSplitters 2
     bool hands = true;
+    // the black bars at the top and bottom of the view when a scene begins or the Mag-charger's x-ray is on
+    // (game/fov.cpp, the game's 0x1396B0): off, they are not drawn
+    bool letterbox = true;
     bool show_fps = false;
     // the performance overlay (panel.cpp DrawStats): where each frame's time goes, the CPU's threads and the GPU's work
     bool show_stats = false;
@@ -43,7 +49,7 @@ struct Options {
     bool log_stats = false;
     // the rain falling around the view and running down the screen (game/weather.cpp)
     bool rain = true;
-    // the blood (game/blood.cpp): the sprays from a hit and the splats and pools it leaves; in online co-op the host's
+    // the blood (game/blood.cpp): the sprays from a hit and the splats and pools it leaves
     bool blood = true;  // the frame rate in the top left corner (common/panel.cpp)
     // the keyboard and mouse are player 1 on a port of their own, the controllers on ports 2-4: a controller's player
     // is never the keyboard's. Off, the first controller shares port 1 with the keyboard.
@@ -55,11 +61,6 @@ struct Options {
     // the picture beside it: an art asset's name in that application (Rich Presence > Art Assets) or an https link;
     // empty for none. The default is the cover (config/discord_cover.jpg) uploaded as "cover"
     std::string discord_image = "cover";
-    // online co-op (net/lockstep.h, the settings panel's Co-op page): the host's address to join, the port hosted on
-    // or joined, the session's password
-    std::string net_address;
-    uint32_t net_port = 7777;
-    std::string net_password;
     // the text's font (game/ts2_style.cpp): 0 the game's Impact, 1 TimeSplitters 2's (from ts2_folder), 2 the early
     // subtitles' Arial Bold
     uint32_t font = 0;

@@ -912,6 +912,7 @@ struct GuestExtent {
 class D3D12Backend final : public Backend, public Context {
 public:
     bool Init(uint32_t width, uint32_t height) override;
+    int Prepare();  // --prepare-shaders (PrepareShaders)
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
@@ -1084,7 +1085,7 @@ private:
     uint32_t EnsureViewSet(const DrawTextures& stages);
     void UpdateTargetUsed(uint32_t data);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
-    uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
+    uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool fixed);
     void SetViewportScissor(const State& s, uint32_t gw, uint32_t gh);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
@@ -1120,7 +1121,7 @@ private:
     PerfClock::time_point pso_lib_stored_;
     std::shared_ptr<std::atomic<bool>> pso_lib_writing_ = std::make_shared<std::atomic<bool>>(false);
     void OpenPipelineLibrary();
-    void SavePipelineLibrary();
+    void SavePipelineLibrary(bool wait = false);  // wait: written before it returns
     // shaders compiled and pipelines built or loaded on the render thread, the time they took: logged every five
     // seconds that had any, the hitches of a place seen for the first time
     struct BuildCounts {
@@ -1141,9 +1142,10 @@ private:
     std::condition_variable prebuild_cv_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> prebuilt_;  // made ahead, not yet asked for
     std::unordered_set<uint64_t> prebuild_claimed_;                       // asked for first: the thread skips them
-    uint64_t prebuild_busy_ = 0;                                          // the one the thread is making
+    std::unordered_set<uint64_t> prebuild_busy_;                          // the ones the threads are making
+    std::atomic<size_t> prebuild_done_{0}, prebuild_total_{0};             // for PrepareShaders' progress
     std::atomic<bool> prebuild_stop_{false}, prebuild_stored_{false};
-    void StartPrebuild();
+    void StartPrebuild(unsigned threads = 1);
     void StopPrebuild();
     ID3D12PipelineState* TakePrebuilt(uint64_t h);
     // Shaders and pipelines met for the first time in play are made by threads of their own: a draw that needs one
@@ -1399,6 +1401,7 @@ private:
     FILE* cap_ = nullptr;
     std::filesystem::path cap_dir_;
     uint32_t cap_i_ = 0;
+    uint32_t draw_ordinal_ = 0;  // the frame's draws so far (XBE_SKIP_DRAWS)
     uint32_t cap_rt_ = 0;
     std::unordered_set<uint32_t> cap_seen_;
     std::unordered_set<uint64_t> cap_sh_;
@@ -1664,6 +1667,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     LoadSettings();
     Begin();
     refresh_ = RefreshRate();
+    LOGR("d3d12: display %u Hz, tearing %s", refresh_, tearing_ ? "allowed" : "not allowed");
     InterpFrameStart();
     StartPrebuild();
     StartWorkers();
@@ -3178,7 +3182,7 @@ void D3D12Backend::LogBuilds() {
     later_ = {};
 }
 
-void D3D12Backend::SavePipelineLibrary() {
+void D3D12Backend::SavePipelineLibrary(bool wait) {
     // a second instance only reads it
     if (!pso_lib_ || app::Instance() > 1 || pso_lib_writing_->load()) return;
     pso_lib_dirty_ = false;
@@ -3186,7 +3190,7 @@ void D3D12Backend::SavePipelineLibrary() {
     // the library serialized by the thread too, megabytes the render thread used to stop for; the library syncs
     // itself against the pipelines stored meanwhile, and one stored between the size and the copy fails it: the
     // next save writes it
-    std::thread([lib = pso_lib_, root = root_hash_, writing = pso_lib_writing_] {
+    auto job = [lib = pso_lib_, root = root_hash_, writing = pso_lib_writing_] {
         std::vector<char> data(16 + lib->GetSerializedSize());
         std::memcpy(data.data(), kPipelineFileMagic, 8);
         std::memcpy(data.data() + 8, &root, 8);
@@ -3203,7 +3207,9 @@ void D3D12Backend::SavePipelineLibrary() {
             if (ok) MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
         writing->store(false);
-    }).detach();
+    };
+    if (wait) job();
+    else std::thread(job).detach();
 }
 
 constexpr char kPipelineKeyMagic[8] = {'X', 'B', 'E', 'P', 'K', 'E', 'Y', '2'};
@@ -3214,7 +3220,7 @@ void D3D12Backend::NotePipelineKey(uint64_t h, const PsoKey& k) {
     std::fflush(pso_key_file_);
 }
 
-void D3D12Backend::StartPrebuild() {
+void D3D12Backend::StartPrebuild(unsigned threads) {
     if (!shader_file_read_) OpenShaderFile();
     if (!pso_lib_tried_) OpenPipelineLibrary();
     std::filesystem::path own = app::ExeDir() / "pipekeys.bin";
@@ -3263,17 +3269,26 @@ void D3D12Backend::StartPrebuild() {
     uint64_t gh;
     ComPtr<ID3DBlob> point_gs = Compile(PointHlsl(), "main", "gs_5_0", gh);
     ComPtr<ID3DBlob> line_gs = Compile(LineHlsl(), "main", "gs_5_0", gh);
-    LOGR("d3d12: %zu pipelines of earlier runs being made ahead (%zu without their shaders)", jobs.size(), missing);
-    prebuild_ = std::thread([this, jobs = std::move(jobs), point_gs, line_gs, lib = pso_lib_] {
+    LOGR("d3d12: %zu pipelines of earlier runs being made ahead on %u threads (%zu without their shaders)", jobs.size(),
+         threads, missing);
+    prebuild_total_ = jobs.size();
+    prebuild_ = std::thread([this, jobs = std::move(jobs), point_gs, line_gs, lib = pso_lib_, threads] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         auto start = PerfClock::now();
-        uint32_t loaded = 0, built = 0;
-        for (const Job& j : jobs) {
+        std::atomic<size_t> next{0};
+        std::atomic<uint32_t> loaded{0}, built{0};
+        // each thread takes the next job; the driver builds pipelines on several threads at once
+        auto work = [&] {
+        for (size_t i; (i = next++) < jobs.size();) {
+            const Job& j = jobs[i];
             if (prebuild_stop_) break;
             {
                 std::lock_guard lock(prebuild_lock_);
-                if (prebuild_claimed_.count(j.h)) continue;
-                prebuild_busy_ = j.h;
+                if (prebuild_claimed_.count(j.h)) {
+                    prebuild_done_++;
+                    continue;
+                }
+                prebuild_busy_.insert(j.h);
             }
             D3D12_INPUT_ELEMENT_DESC el[16];
             D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
@@ -3294,11 +3309,21 @@ void D3D12Backend::StartPrebuild() {
             {
                 std::lock_guard lock(prebuild_lock_);
                 if (pso) prebuilt_[j.h] = std::move(pso);
-                prebuild_busy_ = 0;
+                prebuild_busy_.erase(j.h);
             }
+            prebuild_done_++;
             prebuild_cv_.notify_all();
         }
-        LOGR("d3d12: %u pipelines loaded and %u built ahead in %.0f ms", loaded, built, PerfMs(start));
+        };
+        std::vector<std::thread> helpers;
+        for (unsigned t = 1; t < threads; t++)
+            helpers.emplace_back([&] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                work();
+            });
+        work();
+        for (std::thread& t : helpers) t.join();
+        LOGR("d3d12: %u pipelines loaded and %u built ahead in %.0f ms", loaded.load(), built.load(), PerfMs(start));
     });
 }
 
@@ -3312,7 +3337,7 @@ void D3D12Backend::StopPrebuild() {
 ID3D12PipelineState* D3D12Backend::TakePrebuilt(uint64_t h) {
     if (!prebuild_.joinable()) return nullptr;
     std::unique_lock lock(prebuild_lock_);
-    prebuild_cv_.wait(lock, [&] { return prebuild_busy_ != h; });
+    prebuild_cv_.wait(lock, [&] { return !prebuild_busy_.count(h); });
     auto it = prebuilt_.find(h);
     if (it == prebuilt_.end()) {
         prebuild_claimed_.insert(h);
@@ -3321,6 +3346,61 @@ ID3D12PipelineState* D3D12Backend::TakePrebuilt(uint64_t h) {
     ID3D12PipelineState* pso = (psos_[h] = std::move(it->second)).Get();
     prebuilt_.erase(it);
     return pso;
+}
+
+// what pipelines.bin was prepared for: the GPU, its driver, and the shipped seeds (an update brings new ones); the
+// launcher works out the same line to know when to run --prepare-shaders again
+std::string PrepareStamp(IDXGIAdapter* adapter) {
+    DXGI_ADAPTER_DESC d{};
+    LARGE_INTEGER umd{};
+    if (adapter) {
+        adapter->GetDesc(&d);
+        adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd);
+    }
+    std::error_code ec;
+    auto size = [&](const char* name) {
+        uintmax_t n = std::filesystem::file_size(app::ExeDir() / name, ec);
+        return ec ? 0ull : (unsigned long long)n;
+    };
+    char line[128];
+    std::snprintf(line, sizeof(line), "1 %04X %04X %016llX %llu %llu", d.VendorId, d.DeviceId,
+                  (unsigned long long)umd.QuadPart, size("pipekeys_seed.bin"), size("shaders_seed.bin"));
+    return line;
+}
+
+// --prepare-shaders, from the launcher before play: no window and no game, every pipeline of the shipped seeds and
+// earlier runs made on several threads into pipelines.bin, so the first run loads them instead of building them in
+// play. The progress goes to standard output as "done total" lines; pipelines.stamp says what it was made for
+int D3D12Backend::Prepare() {
+    app::Get().fresh = false;  // the render scale is fitted to the GPU by the game's own first run
+    if (!CreateDevice() || !CreateRootSignature()) return 2;
+    unsigned threads = std::clamp(std::thread::hardware_concurrency(), 2u, 8u) - 1;
+    StartPrebuild(threads);
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    auto say = [&](size_t done, size_t total) {
+        if (!out || out == INVALID_HANDLE_VALUE) return;
+        char line[48];
+        int n = std::snprintf(line, sizeof(line), "%zu %zu\n", done, total);
+        DWORD wrote = 0;
+        WriteFile(out, line, DWORD(n), &wrote, nullptr);
+    };
+    while (prebuild_.joinable() && prebuild_done_ < prebuild_total_) {
+        say(prebuild_done_, prebuild_total_);
+        Sleep(100);
+    }
+    if (prebuild_.joinable()) prebuild_.join();
+    say(prebuild_total_, prebuild_total_);
+    SavePipelineLibrary(true);
+    ComPtr<IDXGIFactory4> f4;
+    ComPtr<IDXGIAdapter> adapter;
+    if (SUCCEEDED(factory_.As(&f4))) f4->EnumAdapterByLuid(dev_->GetAdapterLuid(), IID_PPV_ARGS(&adapter));
+    if (std::FILE* f = _wfopen((app::ExeDir() / "pipelines.stamp").c_str(), L"wb")) {
+        std::string stamp = PrepareStamp(adapter.Get());
+        std::fwrite(stamp.data(), 1, stamp.size(), f);
+        std::fclose(f);
+    }
+    LOGR("d3d12: shaders prepared: %zu pipelines in pipelines.bin", prebuild_total_.load());
+    return 0;
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -3599,7 +3679,8 @@ constexpr uint32_t kTexfAnisotropic = 3;
 constexpr uint32_t kTaddressWrap = 1;
 constexpr uint32_t kTaddressClamp = 3;
 
-D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
+D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, bool fixed,
+                                uint32_t aniso) {
     D3D12_SAMPLER_DESC sd = {};
     const auto& t = s.tss[size_t(i)];
     uint32_t mag = t[kTssMagFilter];
@@ -3618,11 +3699,14 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
         sd.Filter = D3D12_FILTER_ANISOTROPIC;
         sd.MaxAnisotropy = std::min<uint32_t>(an, 16);
     }
-    // clamp: the draw's coordinates all lie in 0..1 (UnitTexcoords), so wrap is read as clamp
+    // clamp: the draw's coordinates all lie in 0..1 (UnitTexcoords), so wrap is read as clamp, unless the fixed
+    // function moves this stage's out of that range with a texture matrix or generates them
+    if (fixed && ((t[kTssTexCoordIndex] >> 16 & 7) || (t[kTssTextureTransformFlags] & 7))) clamp = false;
     sd.AddressU = Address(clamp && t[kTssAddressU] == kTaddressWrap ? kTaddressClamp : t[kTssAddressU]);
     sd.AddressV = Address(clamp && t[kTssAddressV] == kTaddressWrap ? kTaddressClamp : t[kTssAddressV]);
     sd.AddressW = Address(t[kTssAddressW]);
-    sd.MipLODBias = Bits(t[kTssMipLodBias]);
+    // the title can ask past the range the hardware takes
+    sd.MipLODBias = std::clamp(Bits(t[kTssMipLodBias]), D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX);
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
@@ -3636,10 +3720,10 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     return sd;
 }
 
-uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp) {
+uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool fixed) {
     D3D12_SAMPLER_DESC sd[4];
     uint32_t aniso = app::Get().low_profile ? std::min(app::Get().aniso, kLowProfileAniso) : app::Get().aniso;
-    for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, aniso);
+    for (int i = 0; i < 4; i++) sd[i] = StageSampler(s, i, stages, clamp, fixed, aniso);
     uint64_t key = Hash(sd, sizeof(sd));
     auto it = samplers_.find(key);
     if (it != samplers_.end()) return it->second;
@@ -4326,7 +4410,8 @@ bool UnitTexcoords(const Assembled& a) {
     constexpr uint32_t kSmallDrawVertices = 4096;  // most vertices a small draw has
     if (!a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
     bool any = false;
-    for (int r = 0; r < 16; r++) {
+    constexpr int kPositionRegister = 0;  // D3DVSDE_POSITION; 2D sprites send x, y in pixels as FLOAT2
+    for (int r = kPositionRegister + 1; r < 16; r++) {
         const VertexElement& e = a.elements[size_t(r)];
         if (!(a.regs >> r & 1) || e.format != DXGI_FORMAT_R32G32_FLOAT) continue;
         const VertexBuffer& vb = a.buffers[e.buffer];
@@ -4382,7 +4467,8 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
     uint32_t views = EnsureViewSet(stages);
     if (views != binds_.views) cl_->SetGraphicsRootDescriptorTable(2, Gpu(srv_heap_.Get(), views, srv_inc_));
     binds_.views = views;
-    uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a));
+    bool fixed = !a.pretransformed && !((s.vs_handle & 1) && s.vs && !s.vs->program.empty());
+    uint32_t samplers = EnsureStageSamplers(s, stages, AnyStageWraps(s) && UnitTexcoords(a), fixed);
     if (samplers != binds_.samplers) cl_->SetGraphicsRootDescriptorTable(3, Gpu(smp_heap_.Get(), samplers, smp_inc_));
     binds_.samplers = samplers;
 }
@@ -4406,17 +4492,16 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw, uint32_t gh) 
     // it is where it was (rounding the edge itself to host pixels dropped a column the console paints).
     if (s.scissor_count) {
         auto from = [](int32_t e, float k) { return LONG(std::floor((float(e) - 0.5f) * k - 0.5f)) + 1; };
-        auto to = [](int32_t e, float k) { return LONG(std::ceil((float(e) + 0.5f) * k - 0.5f)); };
+        // the right and bottom are the console's last pixel INCLUSIVE (a scissor to 639 479 over 640 by 480 is the
+        // whole target; Doffman's capture of a portal at 201 110 375 321 showed the sky through the row below the
+        // rectangle's last, when a host pixel between the last console pixel's centre and its far edge was left
+        // out). The whole last console pixel is in: the edge is that pixel's far side, and host pixels whose centres
+        // fall inside it are kept. (A 640 or 480 spelled out, as the crane's overlay has, clamps to the target.)
+        auto to = [](int32_t e, float k) { return LONG(std::ceil((float(e) + 1.0f) * k - 0.5f)); };
         x0 = std::max(x0, from(int32_t(s.scissors[0]), sx));
         y0 = std::max(y0, from(int32_t(s.scissors[1]), sy));
-        // a scissor to the console's last column or row (0 0 639 479 over 640 by 480: the crane's view in Scotland
-        // and other overlays) leaves that column unpainted there, a line nobody sees; upscaled it is a strip of the
-        // scene beside a dark border. Such an edge reaches the target's
-        int32_t right = int32_t(s.scissors[2]), bottom = int32_t(s.scissors[3]);
-        if (right == int32_t(gw) - 1) right = int32_t(gw);
-        if (bottom == int32_t(gh) - 1) bottom = int32_t(gh);
-        x1 = std::min(x1, to(right, sx));
-        y1 = std::min(y1, to(bottom, sy));
+        x1 = std::min(x1, to(int32_t(s.scissors[2]), sx));
+        y1 = std::min(y1, to(int32_t(s.scissors[3]), sy));
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
@@ -4684,7 +4769,23 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // geometry, counted while the title runs a visibility test
     uint32_t query = BeginCountedDraw(s);
-    DrawGeometry(a);
+    // XBE_SKIP_DRAWS=<n>,<n>...: those draws of the frame (counted from 1, a capture's draw lines in order) not made, to find
+    // which draw is a flicker
+    static const std::vector<uint32_t> skip = [] {
+        std::vector<uint32_t> v;
+        if (const char* e = std::getenv("XBE_SKIP_DRAWS"))
+            for (const char* p = e; *p;) {
+                char* end;
+                unsigned long n = std::strtoul(p, &end, 10);
+                if (end == p) break;
+                v.push_back(uint32_t(n));
+                p = *end ? end + 1 : end;
+            }
+        for (uint32_t n : v) LOGR("d3d12: XBE_SKIP_DRAWS: draw %u of each frame not made", n);
+        return v;
+    }();
+    draw_ordinal_++;
+    if (skip.empty() || std::find(skip.begin(), skip.end(), draw_ordinal_) == skip.end()) DrawGeometry(a);
     EndCountedDraw(query, raw_points);
     // XBE_CAPTURE_DRAWS=<first>-<last>: a capture also saves the target after each of those draws
     if (cap_ && bound_rt_) {
@@ -5688,6 +5789,7 @@ void D3D12Backend::ResetFrame() {
     FitRenderScale(gpu_ms);
     FitMsaa(gpu_ms);
     fit_partial_ms_ = 0;
+    draw_ordinal_ = 0;
     f.alloc->Reset();
     f.xalloc->Reset();
     f.garbage.clear();
@@ -7161,6 +7263,11 @@ void D3D12Backend::PresenterLoop() {
 }
 
 std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+
+int PrepareShaders() {
+    D3D12Backend backend;
+    return backend.Prepare();
+}
 
 FrameStats Stats() {
     std::lock_guard lock(g_stats_lock);

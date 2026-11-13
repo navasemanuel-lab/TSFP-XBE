@@ -20,7 +20,7 @@ enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
-    uint32_t render_percent = 100;   // of the output height, 1 to 200
+    uint32_t render_percent = 100;   // of the output height, 1 to 450 (4K from a 480-line window)
     uint32_t fps_cap = 60;           // 0 unlimited
     bool vsync = true;
     bool low_latency = true;         // one frame queued for the display, not two: shown a frame sooner after the input
@@ -55,6 +55,11 @@ struct Settings {
     uint32_t link_mode = 0;
     std::string link_address;
     uint32_t link_port = 7778;
+    // the monitor the game shows on, by its Windows device name (DISPLAY2); empty: the primary
+    std::string monitor;
+    bool pause_unfocused = false;  // the game and its sound stop while the window is in the background
+    // the speakers mixed for: 0 as Windows has them, 1 mono, 2 stereo, 3 5.1 (taken at start)
+    uint32_t audio_out = 0;
 };
 
 Settings& Get();
@@ -71,6 +76,18 @@ struct Mode {
     uint32_t width, height;
 };
 Mode Desktop();
+// the connected monitors by their Windows number, and the one the monitor setting picks (HMONITOR)
+struct MonitorInfo {
+    std::string device;  // Windows' device name, as \\.\DISPLAYn
+    uint32_t number, width, height;
+    bool primary;
+};
+std::vector<MonitorInfo> Monitors();
+void* TargetMonitor();
+// the window is in the background with pause_unfocused on: the game's frames wait in Pace, the sound is silent
+inline std::atomic<bool> g_paused{false};
+// the window is in the background (whatever pause_unfocused says): the mixer keeps running but its output is silent
+inline std::atomic<bool> g_background{false};
 Mode Output();
 // host pixels per guest pixel along each axis: the guest frame drawn at the size the output shows it, times
 // render_percent
@@ -139,6 +156,8 @@ struct GameInfo {
 };
 extern const GameInfo kGame;
 
+// the game paces its own frames (a native frame rate): Pace leaves them alone
+inline std::atomic<bool> g_external_pace{false};
 // sleeps out the rest of the frame for the fps cap
 void Pace();
 // sleeps until `at` on a high resolution waitable timer, without spinning a core

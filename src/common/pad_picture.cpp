@@ -12,7 +12,9 @@
 #include <objidl.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -25,6 +27,7 @@ using std::min;
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 
+#include "app/app.h"
 #include "common/pad_picture.h"
 
 namespace pad_picture {
@@ -443,12 +446,37 @@ bool Drawn(Style style) {
 
 std::mutex g_lock;  // GDI+ objects are drawn one at a time
 
+// the controller's picture in prompts\pads (xbox, ps4, ps5, switch .png, cut to the controller); none without the file
+Bitmap* Photo(Style style) {
+    static const wchar_t* kNames[] = {nullptr, nullptr, L"xbox", L"ps4", L"ps5", L"switch"};
+    static std::unique_ptr<Bitmap> photos[6];
+    static bool tried[6];
+    size_t i = size_t(style);
+    if (i >= 6 || !kNames[i]) return nullptr;
+    if (!tried[i]) {
+        tried[i] = true;
+        std::wstring path = (app::ExeDir() / L"prompts" / L"pads" / (std::wstring(kNames[i]) + L".png")).wstring();
+        auto bmp = std::make_unique<Bitmap>(path.c_str());
+        if (bmp->GetLastStatus() == Ok && bmp->GetWidth() && bmp->GetHeight()) photos[i] = std::move(bmp);
+    }
+    return photos[i].get();
+}
+
+// the picture as large as fits the screen's 229 by 144, its proportions kept, centred; moved by (dx, dy) units
+void DrawPhoto(Graphics& g, Bitmap& photo, float dx = 0, float dy = 0) {
+    float pw = float(photo.GetWidth()), ph = float(photo.GetHeight()), s = std::min(kWidth / pw, kHeight / ph);
+    float w = pw * s, h = ph * s;
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.DrawImage(&photo, RectF((kWidth - w) / 2 + dx, (kHeight - h) / 2 + dy, w, h), 0, 0, pw, ph, UnitPixel);
+}
+
 }  // namespace
 
 std::vector<uint32_t> Picture(Style style, uint32_t w, uint32_t h) {
     if (!Drawn(style)) return {};
     std::lock_guard lock(g_lock);
     return Draw(w, h, kWidth, kHeight, 0, 0, [](Graphics& g, Style s) {
+        if (Bitmap* photo = Photo(s)) return DrawPhoto(g, *photo);
         switch (s) {
             case Style::Xbox: Xbox(g); break;
             case Style::Switch: Switch(g); break;
@@ -463,6 +491,14 @@ std::vector<uint32_t> Glow(Style style, uint32_t w, uint32_t h) {
     // the body grown by a few units, its edge softened, in the game's grey
     std::vector<uint32_t> px = Draw(w, h, kGlowWidth, kGlowHeight, (kGlowWidth - kWidth) / 2, (kGlowHeight - kHeight) / 2,
                                     [](Graphics& g, Style s) {
+                                        if (Bitmap* photo = Photo(s)) {  // its shape drawn all round, a few units out
+                                            for (int ring = 1; ring <= 2; ring++)
+                                                for (int k = 0; k < 24; k++) {
+                                                    float a = float(k) * 6.2831853f / 24, r = 3.0f * ring;
+                                                    DrawPhoto(g, *photo, std::cos(a) * r, std::sin(a) * r);
+                                                }
+                                            return;
+                                        }
                                         GraphicsPath body;
                                         Outline(s, body);
                                         SolidBrush fill(Color(255, 255, 255, 255));

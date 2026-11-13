@@ -18,6 +18,8 @@ void Save() {}
 void ApplyDisplay() {}
 Mode Desktop() { return {1280, 720}; }
 Mode Output() { return Desktop(); }
+std::vector<MonitorInfo> Monitors() { return {}; }
+void* TargetMonitor() { return nullptr; }
 Scale2 RenderScale(uint32_t, uint32_t) { return {1.0f, 1.0f}; }
 void AspectFraction(uint32_t& w, uint32_t& h) { w = 16, h = 9; }
 float Aspect() { return 16.0f / 9.0f; }

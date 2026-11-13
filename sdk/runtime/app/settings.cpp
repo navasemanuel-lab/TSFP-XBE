@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cwchar>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <set>
@@ -18,7 +20,6 @@
 
 #include "app/app.h"
 #include "core/log.h"
-#include "net/lockstep.h"
 
 namespace app {
 
@@ -58,7 +59,7 @@ void Load() {
     s.width = t["width"].value_or(s.width);
     s.height = t["height"].value_or(s.height);
     // at most the output's own: past it the scene is supersampled, at a frame rate few GPUs keep
-    s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 1, 200);
+    s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 1, 450);
     // a settings file from before the fitting: the scale there is the player's own, kept
     s.render_fitted = t["render_fitted"].value_or(true);
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
@@ -98,6 +99,9 @@ void Load() {
     s.link_mode = link == "host" ? 1 : link == "join" ? 2 : 0;
     s.link_address = t["link_address"].value_or(s.link_address);
     s.link_port = std::clamp<uint32_t>(t["link_port"].value_or(s.link_port), 1, 65535);
+    s.monitor = t["monitor"].value_or(s.monitor);
+    s.pause_unfocused = t["pause_unfocused"].value_or(s.pause_unfocused);
+    s.audio_out = std::min<uint32_t>(t["audio_output"].value_or(s.audio_out), 3);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -134,7 +138,10 @@ toml::table Table() {
                   {"join_ip", s.join_ip},
                   {"link", s.link_mode == 1 ? "host" : s.link_mode == 2 ? "join" : "off"},
                   {"link_address", s.link_address},
-                  {"link_port", int64_t(s.link_port)}};
+                  {"link_port", int64_t(s.link_port)},
+                  {"monitor", s.monitor},
+                  {"pause_unfocused", s.pause_unfocused},
+                  {"audio_output", int64_t(s.audio_out)}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));
@@ -156,11 +163,16 @@ std::string Text() {
 }  // namespace
 
 void Save() {
-    // a co-op session plays on some of the host's settings (net/lockstep.h): this machine's file keeps its own
-    if (lockstep::Active()) return;
     std::string text = Text();
-    std::ofstream f(File());
-    f << text << "\n";
+    // written beside the real file and renamed over it, so a crash mid save keeps the old settings
+    std::filesystem::path tmp = File();
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp);
+        f << text << "\n";
+        f.close();
+        if (f) MoveFileExW(tmp.c_str(), File().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
     if (!g_logged.empty() && text != g_logged) {
         std::set<std::string> before;
         std::istringstream old(g_logged), now(text);
@@ -181,8 +193,56 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+std::vector<MonitorInfo> Monitors() {
+    std::vector<MonitorInfo> out;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR mon, HDC, LPRECT, LPARAM p) -> BOOL {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+            MonitorInfo m{};
+            for (const wchar_t* c = mi.szDevice; *c; c++) m.device += char(*c);
+            const wchar_t* digits = std::wcsstr(mi.szDevice, L"DISPLAY");
+            m.number = digits ? uint32_t(_wtoi(digits + 7)) : 0;
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm)) m.width = dm.dmPelsWidth, m.height = dm.dmPelsHeight;
+            m.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            reinterpret_cast<std::vector<MonitorInfo>*>(p)->push_back(m);
+            return TRUE;
+        },
+        LPARAM(&out));
+    std::sort(out.begin(), out.end(), [](const MonitorInfo& a, const MonitorInfo& b) { return a.number < b.number; });
+    return out;
+}
+
+void* TargetMonitor() {
+    struct Find {
+        std::wstring device;
+        HMONITOR found = nullptr;
+    } find;
+    for (char c : Get().monitor) find.device += wchar_t(c);
+    if (!find.device.empty())
+        EnumDisplayMonitors(
+            nullptr, nullptr,
+            [](HMONITOR mon, HDC, LPRECT, LPARAM p) -> BOOL {
+                auto* f = reinterpret_cast<Find*>(p);
+                MONITORINFOEXW mi{};
+                mi.cbSize = sizeof(mi);
+                if (GetMonitorInfoW(mon, &mi) && f->device == mi.szDevice) {
+                    f->found = mon;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            LPARAM(&find));
+    // the one picked is unplugged, or none was: the primary
+    return find.found ? find.found : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
 Mode Desktop() {
-    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR mon = static_cast<HMONITOR>(TargetMonitor());
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     DEVMODEW dm{};
@@ -194,7 +254,8 @@ Mode Desktop() {
 
 Mode Output() {
     const Settings& s = Get();
-    if (s.width && s.height) return {s.width, s.height};
+    // borderless covers the monitor at its own size: a smaller picture is the render resolution's job, not the output's
+    if (s.width && s.height && s.display_mode != DisplayMode::Borderless) return {s.width, s.height};
     return Desktop();
 }
 
@@ -203,17 +264,12 @@ void AspectFraction(uint32_t& w, uint32_t& h) {
     static std::atomic<uint64_t> key{~0ull};
     static std::atomic<uint64_t> fraction{uint64_t(16) << 32 | 9};
     const Settings& s = Get();
-    // a co-op session: 16:9 on both machines, the game sizes its views by the shape
-    if (lockstep::Active()) {
-        w = 16, h = 9;
-        return;
-    }
     if (s.aspect && s.aspect < kAspectCount) {
         w = kAspectFractions[s.aspect][0];
         h = kAspectFractions[s.aspect][1];
         return;
     }
-    uint64_t k = uint64_t(s.width) << 32 | s.height;
+    uint64_t k = (uint64_t(s.width) << 32 | s.height) ^ uint64_t(s.display_mode) << 62;
     if (key.exchange(k) != k) {
         Mode m = Output();
         uint32_t a = std::max(m.width, 1u), b = std::max(m.height, 1u);
@@ -245,12 +301,13 @@ Mode CachedOutput() {
     static std::mutex lock;
     static uint32_t width = 0, height = 0;
     static HMONITOR monitor = nullptr;
+    static DisplayMode shown = DisplayMode::Fullscreen;
     static Mode mode{};
     const Settings& s = Get();
     HMONITOR now = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
     std::lock_guard<std::mutex> guard(lock);
-    if (s.width != width || s.height != height || now != monitor || !mode.height) {
-        width = s.width, height = s.height, monitor = now;
+    if (s.width != width || s.height != height || now != monitor || s.display_mode != shown || !mode.height) {
+        width = s.width, height = s.height, monitor = now, shown = s.display_mode;
         mode = Output();
     }
     return mode;

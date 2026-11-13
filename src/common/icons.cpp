@@ -17,8 +17,10 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -141,6 +143,8 @@ RECT DrawLabel(Canvas& c, const std::wstring& text, const wchar_t* face, int siz
 
 // how a button is drawn
 enum class Shape : uint8_t { Key, Round, Pill };
+// a mouse button's picture, 1 to 5 by its name ("Mouse 1"), 0 for a label that is not one
+int MouseNumber(const std::wstring& s) { return s.size() == 7 && s.compare(0, 6, L"Mouse ") == 0 ? s[6] - L'0' : 0; }
 enum class Symbol : uint8_t { None, Cross, Circle, Square, Triangle };
 struct Look {
     const wchar_t* text;
@@ -249,14 +253,40 @@ void DrawSymbol(Canvas& c, Symbol s, uint32_t colour) {
     DeleteObject(pen);
 }
 
-// the button's picture in prompts\ as ARGB rows top down, fitted inside w x h and centred; empty without one
-std::vector<uint32_t> LoadButton(Style style, controls::Button button, uint32_t w, uint32_t h) {
+// a mouse seen from above on the key cap, the button named filled
+void DrawMouse(Canvas& c, int button) {
+    int w = c.w, h = c.h;
+    int bw = std::min(w * 40 / 100, h * 50 / 100), bh = h * 74 / 100, x0 = (w - bw) / 2, y0 = (h - bh) / 2;
+    int x1 = x0 + bw, split = y0 + bh * 40 / 100, mid = (x0 + x1) / 2;
+    HBRUSH none = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH)), lit = CreateSolidBrush(RGB(240, 240, 240));
+    HPEN pen = CreatePen(PS_SOLID, std::max(2, h / 16), RGB(225, 225, 225));
+    HGDIOBJ op = SelectObject(c.dc, pen), ob = SelectObject(c.dc, lit);
+    auto part = [&](bool on, int l, int t, int r, int b) {
+        SelectObject(c.dc, on ? lit : none);
+        Rectangle(c.dc, l, t, r, b);
+    };
+    int wheel = std::max(2, bw / 5);
+    part(button == 1, x0, y0, mid, split);  // the left button
+    part(button == 2, mid, y0, x1, split);  // the right button
+    SelectObject(c.dc, none);
+    RoundRect(c.dc, x0, y0, x1, y0 + bh, bw / 2, bw / 2);  // the body over their outer corners
+    MoveToEx(c.dc, x0, split, nullptr);
+    LineTo(c.dc, x1, split);
+    part(button == 3, mid - wheel / 2, y0 + bh / 8, mid + wheel / 2 + 1, split - bh / 12);  // the wheel
+    // the side buttons on its left, the forward one above the back one
+    int sw = std::max(3, bw / 5), sh = bh / 9;
+    part(button == 5, x0 - sw, split + sh / 2, x0, split + sh / 2 + sh);
+    part(button == 4, x0 - sw, split + sh * 2, x0, split + sh * 3);
+    GdiFlush();
+    SelectObject(c.dc, op);
+    SelectObject(c.dc, ob);
+    DeleteObject(pen);
+    DeleteObject(lit);
+}
+
+// a picture file as ARGB rows top down, fitted inside w x h and centred; empty without one
+std::vector<uint32_t> LoadPng(const std::wstring& path, uint32_t w, uint32_t h) {
     using Microsoft::WRL::ComPtr;
-    static const wchar_t* kFolders[] = {nullptr, nullptr, L"xbox", L"ps4", L"ps5", L"switch"};
-    static const wchar_t* kNames[] = {L"a", L"b", L"x", L"y", L"black", L"white", L"start", L"back"};
-    const wchar_t* folder = kFolders[size_t(style)];
-    if (!folder) return {};
-    std::wstring path = (app::ExeDir() / L"prompts" / folder / (std::wstring(kNames[int(button)]) + L".png")).wstring();
     if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // already in either mode is as good
     ComPtr<IWICImagingFactory> wic;
@@ -295,9 +325,43 @@ std::vector<uint32_t> LoadButton(Style style, controls::Button button, uint32_t 
     return px;
 }
 
+// the button's picture in prompts\ (a controller's folder), empty without one
+std::vector<uint32_t> LoadButton(Style style, controls::Button button, uint32_t w, uint32_t h) {
+    static const wchar_t* kFolders[] = {nullptr, nullptr, L"xbox", L"ps4", L"ps5", L"switch"};
+    static const wchar_t* kNames[] = {L"a", L"b", L"x", L"y", L"black", L"white", L"start", L"back"};
+    const wchar_t* folder = kFolders[size_t(style)];
+    if (!folder) return {};
+    return LoadPng((app::ExeDir() / L"prompts" / folder / (std::wstring(kNames[int(button)]) + L".png")).wstring(), w, h);
+}
+
+// the picture of a key by its label on the prompts ("A", "ENTER", "Mouse 1"...) in prompts\keyboard, without its
+// extension; empty for a key with no picture
+std::wstring KeyFile(const std::string& label) {
+    static const std::pair<const char*, const wchar_t*> kNamed[] = {
+        {"ENTER", L"enter"}, {"SPACE", L"space"}, {"BKSP", L"backspace"}, {"ESC", L"esc"}, {"TAB", L"tab"}, {"CTRL", L"ctrl"},
+        {"SHIFT", L"shift"}, {"ALT", L"alt"}, {"CAPS", L"capslock"}, {"UP", L"up"}, {"DOWN", L"down"}, {"LEFT", L"left"},
+        {"RIGHT", L"right"}, {"PGUP", L"pageup"}, {"PGDN", L"pagedown"}, {"INS", L"ins"}, {"DEL", L"del"}, {"HOME", L"home"},
+        {"END", L"end"}, {"Mouse 1", L"mouse_left"}, {"Mouse 2", L"mouse_right"}, {"Mouse 3", L"mouse_middle"},
+        {"Mouse 4", L"mouse_back"}, {"Mouse 5", L"mouse_forward"},
+        {"MOUSE_XY", L"mouse_xy"}, {"MOUSE_X", L"mouse_x"}, {"MOUSE_Y", L"mouse_y"}};
+    for (const auto& n : kNamed)
+        if (label == n.first) return n.second;
+    if (label.size() == 1 && std::isalnum(uint8_t(label[0]))) return std::wstring(1, wchar_t(std::tolower(uint8_t(label[0]))));
+    if (label.size() >= 2 && label.size() <= 3 && label[0] == 'F' && std::isdigit(uint8_t(label[1])))
+        return L"f" + std::wstring(label.begin() + 1, label.end());
+    return {};
+}
+std::vector<uint32_t> LoadKey(const std::string& label, uint32_t w, uint32_t h) {
+    std::wstring file = KeyFile(label);
+    if (file.empty()) return {};
+    return LoadPng((app::ExeDir() / L"prompts" / L"keyboard" / (file + L".png")).wstring(), w, h);
+}
+
 // the button as ARGB rows top down; black is left transparent
 std::vector<uint32_t> DrawButton(Style style, controls::Button button, uint32_t w, uint32_t h) {
     if (std::vector<uint32_t> picture = LoadButton(style, button, w, h); !picture.empty()) return picture;
+    if (style == Style::Keyboard)
+        if (std::vector<uint32_t> picture = LoadKey(controls::KeyLabel(button), w, h); !picture.empty()) return picture;
     std::vector<uint32_t> px(size_t(w) * h, 0);
     Canvas cap{int(w), int(h)}, text{int(w) * 2, int(h) * 2};
     if (!cap.px || !text.px) return px;
@@ -305,6 +369,10 @@ std::vector<uint32_t> DrawButton(Style style, controls::Button button, uint32_t 
     Look look = LookFor(style, button, keep);
     DrawShape(cap, look.shape);
     if (look.symbol != Symbol::None) DrawSymbol(cap, look.symbol, look.colour);
+    if (int mouse = look.text ? MouseNumber(look.text) : 0; mouse >= 1 && mouse <= 5) {
+        DrawMouse(cap, mouse);
+        look.text = L"";
+    }
     RECT ink{};
     bool has_text = look.text && *look.text;
     if (has_text) {
@@ -381,11 +449,94 @@ bool Ours(size_t i, uint32_t data) {
     return false;
 }
 
+// Keys written in a prompt's text as pictures. The game draws a prompt icon by binding its texture and queueing a quad;
+// the null character's icon (code '8') is drawn once for each key of the text, each time bound with that key's picture:
+// the hook on the bind (game/key_prompts.cpp) puts the next picture into the icon's texture (after the quads queued so
+// far are flushed), and the game's own is back when the text is done.
+struct KeyTexture {
+    uint32_t va = 0, data = 0, format = 0;
+};
+std::map<std::string, KeyTexture> g_key_textures;
+std::vector<std::string> g_queue;  // the keys of the text being drawn, in order
+size_t g_next = 0;
+std::atomic<bool> g_queueing{false};
+bool g_swapped = false;
+uint32_t g_null_data = 0, g_null_format = 0;  // the null icon's own, while a key's picture is in it (named apart from the buttons')
+constexpr size_t kNullIcon = 7;
+
+const KeyTexture* KeyTextureOf(const std::string& label) {
+    auto it = g_key_textures.find(label);
+    if (it != g_key_textures.end()) return it->second.va ? &it->second : nullptr;
+    KeyTexture& t = g_key_textures[label];
+    std::vector<uint32_t> px = LoadKey(label, 64, 64);
+    if (px.empty()) return nullptr;
+    t.va = mem::AllocContiguous(64 * 64 * 4, 0, 0xFFFFFFFF, 0x1000);
+    if (!t.va) return nullptr;
+    auto* out = static_cast<uint32_t*>(kernel::HostPtr(t.va));
+    for (uint32_t y = 0; y < 64; y++)
+        for (uint32_t x = 0; x < 64; x++) out[Swizzle(x, y, 64, 64)] = px[size_t(y) * 64 + x];
+    t.data = mem::PhysicalFromVirtual(t.va);
+    gpu::MarkDataDirty(t.va);
+    t.format = 0x29 | kFormatA8R8G8B8 << 8 | 1u << 16 | Log2(64) << 20 | Log2(64) << 24;
+    return &t;
+}
+
 }  // namespace
 
 const char* Name(Style s) {
     static const char* kNames[] = {"controller (the game's)", "keyboard", "Xbox", "PlayStation 4", "PlayStation 5", "Switch"};
     return kNames[size_t(s)];
+}
+
+bool HasKeyPicture(const std::string& label) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    return KeyTextureOf(label) != nullptr;
+}
+
+void BeginKeyPictures(const std::vector<std::string>& keys) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    g_queue = keys;
+    g_next = 0;
+    g_queueing = !keys.empty();
+}
+
+bool KeyPictureWanted(uint32_t texture_id) {
+    if (!g_queueing) return false;  // the usual bind: no lock
+    std::lock_guard<std::mutex> lock(g_lock);
+    return g_next < g_queue.size() && texture_id && texture_id == kernel::R32(kButtonIds + uint32_t(kNullIcon) * 4);
+}
+
+void PutKeyPicture() {
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_next >= g_queue.size()) return;
+    const KeyTexture* t = KeyTextureOf(g_queue[g_next++]);
+    uint32_t hdr = Header(kNullIcon);
+    if (!t || !hdr) return;
+    if (!g_swapped) {
+        g_null_data = kernel::R32(hdr + 4);
+        g_null_format = kernel::R32(hdr + 12);
+        g_swapped = true;
+    }
+    kernel::W32(hdr + 4, t->data);
+    kernel::W32(hdr + 12, t->format);
+}
+
+bool EndKeyPictures() {
+    std::lock_guard<std::mutex> lock(g_lock);
+    g_queue.clear();
+    g_next = 0;
+    g_queueing = false;
+    return g_swapped;
+}
+
+void GiveBackNullIcon() {
+    std::lock_guard<std::mutex> lock(g_lock);
+    uint32_t hdr = g_swapped ? Header(kNullIcon) : 0;
+    if (hdr) {
+        kernel::W32(hdr + 4, g_null_data);
+        kernel::W32(hdr + 12, g_null_format);
+    }
+    g_swapped = false;
 }
 
 void KeysChanged() {
@@ -398,7 +549,7 @@ Style Current() {
     return g_style;
 }
 
-void Update(Style style) {
+void Update(Style style, bool log) {
     std::lock_guard<std::mutex> lock(g_lock);
     bool original = style == Style::Original;
     Set& set = g_sets[size_t(style)];
@@ -427,7 +578,7 @@ void Update(Style style) {
         kernel::W32(hdr + 4, set.data[i]);
         kernel::W32(hdr + 12, set.format[i]);
     }
-    if (g_style != style) LOGI("icons: %s prompts", Name(style));
+    if (log && g_style != style) LOGI("icons: %s prompts", Name(style));
     g_style = style;
 }
 

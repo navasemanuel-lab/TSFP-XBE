@@ -8,13 +8,11 @@
 // and usable. The place's weapon is then taken with sub_001BA130(entity, weapon) and the weapon HUD redrawn
 // (sub_00142820). A place with nothing in it does nothing; nothing is ever given.
 //
-// Only the first input slot's player, the keyboard's. Not in an online co-op session (net/lockstep.h): both machines
-// play the same game from the pads alone, and a weapon taken on one only would part them.
+// Only the first input slot's player, the keyboard's.
 #include "common/controls.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -36,7 +34,7 @@ void TakeWeapon(X86Context& ctx) {
     uint32_t player = kernel::R32(kPlayer);
     if (!Valid(player, kPlayerSize) || kernel::R32(player + kSlot) != 0) return;
     int place = controls::TakeWeapon();
-    if (!place || lockstep::Active()) return;
+    if (!place) return;
     // on foot and free to act, the game not paused
     if (!(kernel::R32(player + kState) & 0x480E) || (kernel::R32(player + kFlags) & 0x4000) ||
         int32_t(kernel::R32(kLockout)) > 100)

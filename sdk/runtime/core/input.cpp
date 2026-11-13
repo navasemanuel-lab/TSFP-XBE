@@ -10,7 +10,6 @@
 
 #include "app/app.h"
 #include "core/log.h"
-#include "net/lockstep.h"
 
 namespace input {
 
@@ -167,11 +166,6 @@ void Init() {
 }
 
 Pad Poll(int port) {
-    if (lockstep::Active()) return lockstep::PortPad(port);  // a co-op session: the frame's controls, both machines'
-    return PollLocal(port);
-}
-
-Pad PollLocal(int port) {
     Pad p = Read(port);
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;

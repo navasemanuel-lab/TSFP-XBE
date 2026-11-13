@@ -29,23 +29,16 @@
 // Each player has angles of their own (Opt().fov and weapon_fov player 1's): the view built is the player's being
 // updated, the weapon lens the player's whose camera is the current one.
 //
-// Online co-op (net/lockstep.h) plays one game on two machines, which must stay alike: the camera is built as the
-// game makes it, and only while this machine's player is drawn (coop_online.cpp) is it widened, at this machine's
-// angles (player 1's settings), then put back. The other player's view, drawn into nothing here, keeps the game's.
-//
-// The shape: the device set-up keeps the screen's as two whole numbers, 16 and 9 at 0x4C0458 and 0x4C045C (4 and 3
-// on a 4:3 TV), and the squeeze the 2D layer is drawn with, 0.75 at 0x4C0460 (1.0). The camera and the menus read
-// them each frame, so writing them switches the shape while the game runs. Any other shape (16:10, 21:9, 32:9, a
-// monitor's own) goes in as its fraction with the squeeze 4:3 over it; the game's one test of the shape, sub_0003C420,
-// asks for exactly 16:9, and answers instead whether it is wider than 4:3.
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include "app/app.h"
 #include "common/options.h"
+#include "core/log.h"
 #include "gpu/shaders.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
+#include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
 namespace game {
@@ -105,16 +98,6 @@ void Widen(uint32_t camera, float scale) {
     kernel::G<float>(camera + 0x380) *= scale;
 }
 
-// online co-op: each player's camera when last built as their own view (0 otherwise), and the one widened while this
-// machine's player is drawn, as it was
-uint32_t g_views[4] = {};
-struct Saved {
-    uint32_t camera = 0, matrix = 0;
-    uint32_t lens[2] = {}, cull[2] = {};
-};
-Saved g_saved;
-bool g_local_pass = false;
-
 // the player's own view on foot or in the air (states 2 and 4), not a letterbox transition
 bool PlayerView(uint32_t caller) {
     if (caller != kFromPlay1 && caller != kFromPlay2) return false;
@@ -131,40 +114,13 @@ bool PlayerView(uint32_t caller) {
 bool FovLocked() { return kernel::R32(kSession) && kernel::R32(kSessionUp); }
 
 void ApplyWeaponFov(uint32_t slot) {
-    // online co-op: this machine's angle for its own player's view, the game's for the other's
-    if (lockstep::Active()) slot = 0;
-    bool game = FovLocked() || (lockstep::Active() && !g_local_pass);
+    bool game = FovLocked();
     float weapon = game ? kGameWeaponFov : float(std::clamp<uint32_t>(WeaponFov(slot), 20, 120));
     kernel::G<float>(kWeaponLens) = weapon / kGameWeaponFov / kGameFov;
 }
 void ApplyWeaponFov() { ApplyWeaponFov(0); }
 
 void SampleDiscord();  // game/discord.cpp
-
-// online co-op: this machine's player's pass begins (its camera widened) or ends (put back as the game made it)
-void LocalView(bool on) {
-    g_local_pass = on;
-    if (!on) {
-        if (g_saved.camera) {
-            kernel::W32(g_saved.matrix, g_saved.lens[0]);
-            kernel::W32(g_saved.matrix + 0x14, g_saved.lens[1]);
-            kernel::W32(g_saved.camera + 0x37C, g_saved.cull[0]);
-            kernel::W32(g_saved.camera + 0x380, g_saved.cull[1]);
-        }
-        g_saved = {};
-        gpu::g_view_widening = 1.0f;
-        return;
-    }
-    uint32_t camera = kernel::R32(kCamera), slot = SlotOf(kernel::R32(kPlayer));
-    float scale = ScaleOf(Opt().fov);
-    if (g_saved.camera || !camera || g_views[slot] != camera || scale == 1.0f || !Valid(camera, 0x384)) return;
-    uint32_t matrix = kernel::R32(camera + 0x204);
-    if (!Valid(matrix, 0x18)) return;
-    g_saved = {camera, matrix, {kernel::R32(matrix), kernel::R32(matrix + 0x14)},
-               {kernel::R32(camera + 0x37C), kernel::R32(camera + 0x380)}};
-    Widen(camera, scale);
-    gpu::g_view_widening = scale;
-}
 
 void ApplyScreenShape() {
     uint32_t w, h;
@@ -187,14 +143,6 @@ X86_FUNC(sub_000C77C0) {
     game::SampleDiscord();  // each frame, in play and the front end
     bool view = game::PlayerView(caller);
     uint32_t slot = game::SlotOf(kernel::R32(game::kPlayer)), camera = kernel::R32(game::kCamera);
-    if (lockstep::Active()) {
-        // as the game made it: widened only while drawn
-        if (view) game::g_views[slot] = camera;
-        else
-            for (uint32_t& v : game::g_views)
-                if (v == camera) v = 0;
-        return;
-    }
     if (!view) {
         // a player's camera in a cutscene or the like: the game's own angle
         if (caller == game::kFromPlay1 || caller == game::kFromPlay2) gpu::g_view_widening = 1.0f;
@@ -243,6 +191,115 @@ X86_FUNC(sub_001BF410) {
     if (game::Valid(arms, 0x2C)) kernel::W32(arms + 0x28, kernel::R32(arms + 0x28) & ~1u);
 }
 
+// the black bars over the view (two shaded rectangles by the letterbox phase): not drawn with the option off
+namespace {
+
+// a pause, objectives or status screen is up (the menus' own test, menu_mouse.cpp): it uses the bars, so they stay
+bool MenuUp() {
+    uint32_t pause = kernel::R32(0x761C48);
+    return pause >= 0x10000 && mem::IsCommitted(pause) && (kernel::R32(pause) & 1);
+}
+
+// the bars are left out of the view: the option off and no menu over it
+bool BarsOff() { return !game::Opt().letterbox && !MenuUp(); }
+
+float Float(uint32_t at) {
+    uint32_t v = kernel::R32(at);
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+}
+
+// the black bars of a cutscene (24 vertices) or the x-ray (12): one strip in screen units, a band across the top (0 to
+// its edge), one across the bottom (its edge to 480) and, in a cutscene, a line down each side between them
+bool LeaveOutBars(uint32_t prim, uint32_t start, uint32_t count, uint32_t positions, uint32_t stride) {
+    if (!BarsOff() || prim != 5 || (count != 24 && count != 12)) return false;
+    auto at = [&](uint32_t i, uint32_t axis) { return Float(positions + (start + i) * stride + axis * 4); };
+    float top = at(2, 1), bottom = at(6, 1);
+    return at(0, 0) == 0 && at(0, 1) == 0 && at(1, 0) == 640 && at(11, 0) == 640 && at(11, 1) == 480 &&
+           at(8, 1) == 480 && top > 0 && top < bottom && bottom < 480 && at(5, 1) == top && at(7, 1) == bottom;
+}
+
+void PutFloat(uint32_t at, float f) {
+    uint32_t v;
+    std::memcpy(&v, &f, 4);
+    kernel::W32(at, v);
+}
+
+// the Mag-charger's x-ray works on a band of the screen, rows 64 to 416: a copy of the band to a 160x120 target (rows
+// 16 to 104 of it), back from there, a darkening and a grain over it. With the bars gone the band is the whole screen:
+// each of those quads' top and bottom go to the edge and its texture rows with them, as far as they run
+bool WidenXray(uint32_t prim, uint32_t start, uint32_t count, uint32_t positions, uint32_t stride) {
+    if (!BarsOff() || (count != 4 && count != 6)) return false;
+    auto pos = [&](uint32_t i) { return positions + (start + i) * stride; };
+    float lo = 1e9f, hi = -1e9f, x0 = 1e9f, x1 = -1e9f;
+    for (uint32_t i = 0; i < count; i++) {
+        float y = Float(pos(i) + 4), x = Float(pos(i));
+        lo = std::min(lo, y), hi = std::max(hi, y);
+        x0 = std::min(x0, x), x1 = std::max(x1, x);
+    }
+    float full;
+    if (lo == 64 && hi == 416 && x0 == 0 && x1 == 640) full = 480;
+    else if (lo == 16 && hi == 104 && x0 == 0 && x1 == 160) full = 120;
+    else return false;
+    for (uint32_t i = 0; i < count; i++) {
+        float y = Float(pos(i) + 4);
+        if (y != lo && y != hi) return false;
+    }
+    // the texture's rows, a pair of floats after the position and its next four bytes, where there are any
+    float slope = 0;
+    if (count == 4) {
+        float vlo = 0, vhi = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            (Float(pos(i) + 4) == lo ? vlo : vhi) = Float(pos(i) + 20);
+        }
+        slope = (vhi - vlo) / (hi - lo);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        float y = Float(pos(i) + 4), edge = y == lo ? 0.0f : full;
+        if (count == 4) PutFloat(pos(i) + 20, Float(pos(i) + 20) + (edge - y) * slope);
+        PutFloat(pos(i) + 4, edge);
+    }
+    return false;
+}
+
+bool VerticesDrawn(uint32_t prim, uint32_t start, uint32_t count, uint32_t positions, uint32_t stride) {
+    if (LeaveOutBars(prim, start, count, positions, stride)) return true;
+    return WidenXray(prim, start, count, positions, stride);
+}
+
+const bool g_bars = [] {
+    d3d::g_vertices_draw_hook = VerticesDrawn;
+    return true;
+}();
+
+
+}  // namespace
+
+// the game's clip rectangle (x0, y0, x1, y1): the x-ray and the cutscenes clip the view between the bars, rows 64 to
+// 416 or 72 to 408; with the bars gone it is the whole screen
+X86_EXTERN_FUNC(__imp__sub_0001A010);
+X86_FUNC(sub_0001A010) {
+    if (BarsOff()) {
+        uint32_t x0 = kernel::R32(ctx.esp + 4), y0 = kernel::R32(ctx.esp + 8), x1 = kernel::R32(ctx.esp + 12),
+                 y1 = kernel::R32(ctx.esp + 16);
+        if (x0 == 0 && x1 == 640 && y0 >= 56 && y0 <= 80 && y0 + y1 >= 478 && y0 + y1 <= 482) {
+            kernel::W32(ctx.esp + 8, 0);
+            kernel::W32(ctx.esp + 16, 480);
+        }
+    }
+    __imp__sub_0001A010(ctx, base);
+}
+
+X86_EXTERN_FUNC(__imp__sub_001396B0);
+X86_FUNC(sub_001396B0) {
+    if (BarsOff()) {
+        ctx.esp += 4;
+        return;
+    }
+    __imp__sub_001396B0(ctx, base);
+}
+
 // the shape is widescreen: 16:9 to the game, now any shape wider than 4:3
 X86_FUNC(sub_0003C420) {
     kernel::Return(ctx, uint64_t(kernel::R32(game::kShapeW)) * 3 > uint64_t(kernel::R32(game::kShapeH)) * 4, 0);
@@ -273,4 +330,38 @@ X86_FUNC(sub_00151CF0) {
     if (!game::Valid(lens, 0x18)) return;
     kernel::W32(matrix, kernel::R32(lens));
     kernel::W32(matrix + 0x14, kernel::R32(lens + 0x14));
+}
+
+// A node of a model drawn, first person arms included (0x18EA90: model, node): with the weapon's angle past 100 the
+// arms' two rigid shoulder roots stand out of the screen's edge, so they are not drawn. The arms entity is the
+// viewed player's +0xE84 (its model +4 the header whose count is at +0 and 200-byte nodes before it); a root is
+// parent 0xFF at node 0's +0x4A and, in the node, type 0 (+0x48), no parent (+0x4A) and bone 1 or 10 (+0x49), as in
+// TheDoffman/timesplitters-future-perfect-pc's patch 2720. The skinned upper arms, elbows and hands are still drawn.
+X86_EXTERN_FUNC(__imp__sub_0018EA90);
+X86_FUNC(sub_0018EA90) {
+    constexpr uint32_t kViewPlayer = 0x7B0C7C, kNodeSize = 200, kMostNodes = 128;
+    uint32_t model = kernel::R32(ctx.esp + 4), node = kernel::R32(ctx.esp + 8);
+    uint32_t player = kernel::R32(kViewPlayer);
+    bool hide = false;
+    if (node && game::Valid(player, 0xE88) && !game::FovLocked()) {
+        uint32_t slot = std::min<uint32_t>(kernel::R32(player + 4), 3);
+        uint32_t arms = kernel::R32(player + 0xE84);
+        if (game::WeaponFov(slot) > 100 && game::Valid(arms, 8) && kernel::R32(arms + 4) == model &&
+            game::Valid(model, 8) && kernel::R32(model) == arms) {
+            uint32_t header = kernel::R32(model + 4), count = game::Valid(header, 4) ? kernel::R32(header) : 0;
+            if (count && count <= kMostNodes && node < count && header >= count * kNodeSize) {
+                uint32_t first = header - count * kNodeSize, at = first + node * kNodeSize;
+                if (game::Valid(first, count * kNodeSize)) {
+                    auto byte = [](uint32_t va) { return kernel::G<uint8_t>(va); };
+                    hide = byte(first + 0x4A) == 255 && byte(at + 0x48) == 0 && byte(at + 0x4A) == 0 &&
+                           (byte(at + 0x49) == 1 || byte(at + 0x49) == 10);
+                }
+            }
+        }
+    }
+    if (hide) {
+        ctx.esp += 4;  // the caller drops the arguments
+        return;
+    }
+    __imp__sub_0018EA90(ctx, base);
 }

@@ -2,9 +2,6 @@
 // four ways, each hooked where it is (game/briefing.cpp: FileSize 0x62CA0 and ReadFile 0x62D20; game/beta_cortez.cpp:
 // MappedFile 0x624C0, a Story level's file in its pak loaded whole, and OpenStream 0x62E20, the characters streamed
 // in Arcade and MapMaker): each asks File before the paks.
-//
-// In online co-op both machines must have the same mods switched on: a file one has and the other has not plays the
-// level apart (the session's state check says so in the log).
 #include <algorithm>
 #include <cctype>
 #include <cstring>

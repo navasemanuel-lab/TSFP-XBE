@@ -49,6 +49,19 @@ if exist ".local\update_repo.txt" copy /y ".local\update_repo.txt" "%STAGE%\upda
 xcopy /e /i /q /y prompts "%STAGE%\prompts" >nul || exit /b 1
 copy /y README.md "%STAGE%\" >nul
 copy /y sdk\THIRD_PARTY.txt "%STAGE%\" >nul
+> "%STAGE%\INSTALL.txt" (
+echo TimeSplitters: Future Perfect - XBE Recomp
+echo.
+echo 1. Extract all of TSFP.zip to a folder you can write to ^(not from inside the zip, not Program Files^).
+echo 2. Run "TSFP Launcher.exe" and choose Import / Repair: pick your US Xbox disc image ^(.iso^) or the default.xbe of
+echo    your extracted game, or drop it on the window. The game's files are not part of this download.
+echo 3. Press Play. The launcher's Updates section installs new releases.
+echo.
+echo Without the launcher: put the disc image or default.xbe with its folders in the assets folder and run TSFP.exe.
+echo.
+echo If the launcher does not open: it writes launcher.log beside itself, and shows a message when it cannot start.
+echo TSFP.exe can be run directly. More: README.md.
+)
 echo Put your US Xbox game here: default.xbe with the game's folders beside it, or the disc image (.iso).> "%STAGE%\assets\PUT THE GAME HERE.txt"
 mkdir "%STAGE%\mods"
 rem the mods made from the game's files into out/build/release/mods_play (the early Cortez by tools/tsfp_model.py,

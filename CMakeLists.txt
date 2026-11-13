@@ -56,7 +56,7 @@ add_executable(TSFPLauncher WIN32 launcher/launcher.cpp ${SDK}/runtime/kernel/di
 set_target_properties(TSFPLauncher PROPERTIES OUTPUT_NAME "TSFP Launcher")
 target_include_directories(TSFPLauncher PRIVATE ${SDK}/runtime)
 target_compile_definitions(TSFPLauncher PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(TSFPLauncher PRIVATE d2d1 dwrite windowscodecs ole32 shell32 bcrypt dwmapi winhttp)
+target_link_libraries(TSFPLauncher PRIVATE d2d1 dwrite windowscodecs ole32 shell32 uuid bcrypt dwmapi dxgi winhttp)
 if(GAME_ICON_RC)
     target_sources(TSFPLauncher PRIVATE ${GAME_ICON_RC})
 endif()

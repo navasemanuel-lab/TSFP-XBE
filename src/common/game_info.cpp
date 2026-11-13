@@ -17,13 +17,11 @@
 #include "common/panel.h"
 #include "core/input.h"
 #include "gpu/backend.h"
-#include "net/lockstep.h"
 #include "xdk/d3d8.h"
 
 namespace game {
 
 void InstallBriefingTab();  // game/briefing.cpp
-void StartCoopOnline();     // game/coop_online.cpp
 void ApplyWeaponFov();      // game/fov.cpp
 void InitFont();            // game/ts2_style.cpp
 void InitSaveSignatures();  // game/save_signatures.cpp
@@ -50,42 +48,6 @@ void Init() {
     controls::LoadKeys();
     if (Opt().keys.size() != before) app::Save();
     StartDiscord();
-    // online co-op: the settings that change how the game plays out are the host's on both machines
-    static const lockstep::Pin pins[] = {{"skip_intros", &Opt().skip_intros, nullptr},
-                                         {"skip_any_cutscene", &Opt().skip_any_cutscene, nullptr},
-                                         {"fast_loading", &Opt().fast_loading, nullptr},
-                                         {"player_names", &Opt().player_names, nullptr},
-                                         {"rain", &Opt().rain, nullptr},
-                                         {"blood", &Opt().blood, nullptr},
-                                         // what the game loads and where the cameras look: the guest's own
-                                         // drifted the games apart (Javi's session, 2026-10-29: at frame 60)
-                                         {"hands", &Opt().hands, nullptr},
-                                         {"font", nullptr, &Opt().font},
-                                         {"hud_style", nullptr, &Opt().hud_style},
-                                         {"skyline_model", nullptr, &Opt().skyline_model},
-                                         {"story_character_p1", nullptr, &Opt().story_character[0]},
-                                         {"story_character_p2", nullptr, &Opt().story_character[1]},
-                                         {"language", nullptr, &app::Get().language},
-                                         {"fov", nullptr, &Opt().fov},
-                                         {"fov_p2", nullptr, &Opt().player_fov[0]},
-                                         {"fov_p3", nullptr, &Opt().player_fov[1]},
-                                         {"fov_p4", nullptr, &Opt().player_fov[2]},
-                                         {"weapon_fov", nullptr, &Opt().weapon_fov},
-                                         {"weapon_fov_p2", nullptr, &Opt().player_weapon_fov[0]},
-                                         {"weapon_fov_p3", nullptr, &Opt().player_weapon_fov[1]},
-                                         {"weapon_fov_p4", nullptr, &Opt().player_weapon_fov[2]}};
-    lockstep::Pins(pins, int(std::size(pins)));
-    // the mods switched on, by folder and file count
-    std::string on;
-    uint64_t hash = 0xCBF29CE484222325ull;
-    for (const mods::Mod& m : mods::List()) {
-        if (!m.on) continue;
-        std::string one = m.folder + "#" + std::to_string(m.files);
-        for (char c : one + ";") hash = (hash ^ uint8_t(c)) * 0x100000001B3ull;
-        on += (on.empty() ? "" : ", ") + m.name;
-    }
-    lockstep::Content(hash, on.empty() ? "none" : on);
-    StartCoopOnline();
 }
 
 // each frame inside the host's ImGui frame. The host hands window messages to ImGui first, and ImGui answers
@@ -114,8 +76,6 @@ void Load(const void* table) {
     const toml::table& t = *static_cast<const toml::table*>(table);
     if (auto id = t["discord_app_id"].value<std::string>()) Opt().discord_app_id = *id;
     if (auto image = t["discord_image"].value<std::string>()) Opt().discord_image = *image;
-    if (auto a = t["net_address"].value<std::string>()) Opt().net_address = *a;
-    if (auto p = t["net_password"].value<std::string>()) Opt().net_password = *p;
     if (auto f = t["ts2_folder"].value<std::string>()) Opt().ts2_folder = *f;
     if (auto f = t["ts4_folder"].value<std::string>()) Opt().ts4_folder = *f;
     if (auto f = t["preview_path"].value<std::string>()) Opt().preview_path = *f;
@@ -135,8 +95,6 @@ void Save(void* table) {
     t.insert_or_assign("keys", keys);
     t.insert_or_assign("discord_app_id", Opt().discord_app_id);
     t.insert_or_assign("discord_image", Opt().discord_image);
-    t.insert_or_assign("net_address", Opt().net_address);
-    t.insert_or_assign("net_password", Opt().net_password);
     t.insert_or_assign("ts2_folder", Opt().ts2_folder);
     t.insert_or_assign("ts4_folder", Opt().ts4_folder);
     t.insert_or_assign("preview_path", Opt().preview_path);
@@ -145,10 +103,7 @@ void Save(void* table) {
 
 // window thread: the mouse and its cursor
 bool Message(void*, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* result) {
-    if (msg == WM_DESTROY) {
-        StopDiscord();    // the presence cleared as the game closes
-        lockstep::Bye();  // and a co-op partner told
-    }
+    if (msg == WM_DESTROY) StopDiscord();  // the presence cleared as the game closes
     if (panel::Message(msg, wp, lp, result)) return true;
     // Alt+Enter: a window, or back to the full screen mode it came from; kept in the settings file
     constexpr intptr_t kAltDown = 1 << 29, kRepeat = 1 << 30;
@@ -194,6 +149,7 @@ const app::GameInfo app::kGame = {
     .missing = L"Put TimeSplitters Future Perfect in the assets folder: its disc image (.iso), or default.xbe with its pak and xmv folders beside it.",
     .images = {{"default.xbe", "TSFP"}},       // each recompiled xbe and its exe, for title launches
     .options = {{"skip_intros", &game::Opt().skip_intros, nullptr},
+                {"fps_target", nullptr, &game::Opt().fps_target},
                 {"skip_any_cutscene", &game::Opt().skip_any_cutscene, nullptr},
                 {"fast_loading", &game::Opt().fast_loading, nullptr},
                 {"player_names", &game::Opt().player_names, nullptr},
@@ -212,6 +168,7 @@ const app::GameInfo app::kGame = {
                 {"gyro_aim", &game::Opt().gyro_aim, nullptr},
                 {"gyro_speed", nullptr, &game::Opt().gyro_speed},
                 {"hands", &game::Opt().hands, nullptr},
+                {"letterbox", &game::Opt().letterbox, nullptr},
                 {"show_fps", &game::Opt().show_fps, nullptr},
                 {"show_stats", &game::Opt().show_stats, nullptr},
                 {"log_stats", &game::Opt().log_stats, nullptr},
@@ -224,8 +181,7 @@ const app::GameInfo app::kGame = {
                 {"story_character_p1", nullptr, &game::Opt().story_character[0]},
                 {"story_character_p2", nullptr, &game::Opt().story_character[1]},
                 {"keyboard_own_port", &game::Opt().keyboard_own_port, nullptr},
-                {"discord", &game::Opt().discord, nullptr},
-                {"net_port", nullptr, &game::Opt().net_port}},
+                {"discord", &game::Opt().discord, nullptr}},
     .load = game::Load,                        // reads more from the settings file's toml::table
     .save = game::Save,                        // writes more into it
     .init = game::Init,                        // after the settings load, before the window and boot

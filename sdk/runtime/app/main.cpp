@@ -25,7 +25,6 @@
 #include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
-#include "net/lockstep.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -37,6 +36,7 @@ HWND g_hwnd = nullptr;
 constexpr UINT kApplyDisplay = WM_APP + 1, kOpenWindow = WM_APP + 2;
 bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
+std::atomic<bool> g_unfocused{false};  // the game window was active and is no longer
 
 // crash dump in CrashDumps beside the exe
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
@@ -82,14 +82,18 @@ void DumpThreads() {
 // window thread only
 void ApplyNow() {
     const Settings& s = Get();
-    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+    // a changed mode is put back on the monitor that has it, which is not the one picked after a move
+    if (g_mode_changed) {
+        MONITORINFOEXW was{};
+        was.cbSize = sizeof(was);
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &was);
+        ChangeDisplaySettingsExW(was.szDevice, nullptr, nullptr, 0, nullptr);
+        g_mode_changed = false;
+    }
+    HMONITOR mon = static_cast<HMONITOR>(TargetMonitor());
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(mon, &mi);
-    if (g_mode_changed) {
-        ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
-        g_mode_changed = false;
-    }
     Mode out = Output();
     LONG_PTR visible = IsWindowVisible(g_hwnd) ? WS_VISIBLE : 0;  // a window held back for a splash or handover stays so
     DEVMODEW desktop{};
@@ -146,6 +150,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_ACTIVATE:
+            g_unfocused = LOWORD(wp) == WA_INACTIVE;
+            g_background = g_unfocused.load();
             if (LOWORD(wp) == WA_INACTIVE) {
                 // a changed display mode steps aside for the desktop, minimized, and comes back on return; not while
                 // handing over to the next instance, which runs in the same mode
@@ -214,12 +220,20 @@ void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
 void Pace() {
-    if (lockstep::Active()) return;  // a co-op session paces the game's frames itself
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
+    // in the background: the frame waits until the window is back (not while handing over to the next instance,
+    // whose window comes up in front); the mixer plays silence meanwhile
+    if (g_unfocused && Get().pause_unfocused && !HandingOver() && !kernel::g_relaunching) {
+        g_paused = true;
+        LOGI("paused: the window is in the background");
+        while (g_unfocused && Get().pause_unfocused && !kernel::g_relaunching) Sleep(20);
+        g_paused = false;
+        next = clock::now();
+    }
     uint32_t cap = Get().fps_cap;
     auto now = clock::now();
-    if (!cap) {
+    if (!cap || g_external_pace) {
         next = now;
         return;
     }
@@ -255,10 +269,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // one log a session: a relaunch into another image carries on its predecessor's
     bool relaunched = std::wcsstr(GetCommandLineW(), L"--relaunched") != nullptr;
-    std::string log = app::kGame.log;
+    // the launcher's shader preparation (gpu::PrepareShaders): its own log, no window, no game
+    bool prepare = std::wcsstr(GetCommandLineW(), L"--prepare-shaders") != nullptr;
+    std::string log = std::string(app::kGame.log) + (prepare ? "-shaders" : "");
     if (app::Instance() > 1) log += "-" + std::to_string(app::Instance());
     logx::Init((app::ExeDir() / "logs").string(), log, relaunched);
     app::Load();
+    if (prepare) {
+        int code = gpu::PrepareShaders();
+        logx::Flush();
+        return code;
+    }
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
     else app::LogSystem();
@@ -299,12 +320,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     std::wstring hdd = app::Instance() > 1 ? L"hdd" + std::to_wstring(app::Instance()) : L"hdd";
     if (app::Instance())
         SetWindowTextW(app::g_hwnd, (std::wstring(app::kGame.title) + L" [" + std::to_wstring(app::Instance()) + L"]").c_str());
-    // online co-op asked for on the command line: set up before the game boots (the joiner's saves become the host's)
     std::filesystem::path data_dir = app::ExeDir() / hdd;
-    if (!lockstep::Begin(game.xbe, data_dir)) {
-        logx::Flush();
-        return 1;
-    }
     if (!kernel::Boot(std::move(game.xbe), IMAGE_XBE, game.dir.string(), data_dir.string())) {
         MessageBoxW(app::g_hwnd, L"The game failed to start, see the log in the logs folder.", app::kGame.short_title,
                     MB_ICONERROR);
@@ -317,7 +333,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
     if (app::g_mode_changed) ChangeDisplaySettingsW(nullptr, 0);
-    lockstep::Bye();
     logx::Flush();
     kernel::Shutdown(0);
 }

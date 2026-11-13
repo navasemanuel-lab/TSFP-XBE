@@ -168,7 +168,6 @@ ThreadRef CurrentRef();
 void StartHostThread(const char* name, std::function<void(X86Context&)> fn);
 void RunDpcs(X86Context& ctx);
 void InitKernelData();
-void SetClockData(uint64_t t100);  // a co-op session: the clock data in guest memory at a frame start (net/lockstep.h)
 void LogGuestStack(X86Context& ctx, int words);
 X86Context& CurrentContext();
 ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_routine, uint32_t start_routine,

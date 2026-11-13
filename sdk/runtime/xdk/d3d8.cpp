@@ -18,7 +18,6 @@
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
-#include "net/lockstep.h"
 
 using namespace kernel;
 
@@ -281,10 +280,10 @@ using namespace d3d;
 
 namespace {
 std::atomic<uint32_t> g_presents{0};
-// a draw, clear or copy: counted, and false while the view being drawn is not this machine's (g_hide_draws)
+// a draw, clear or copy: counted
 bool Hidden() {
     g_draw_count.fetch_add(1, std::memory_order_relaxed);
-    return g_hide_draws.load(std::memory_order_relaxed);
+    return false;
 }
 // XBE_TRACE=<present>: the D3D calls of the four frames from that present on, for debugging
 // XBE_SKIP_DRAWS=<first>-<last>: those draws of every frame (counted from the frame's first) are not drawn, for debugging
@@ -655,7 +654,6 @@ HLE_STDCALL(D3DDevice_GetDepthStencilSurface2, 0) {
 HLE_STDCALL(D3DDevice_Swap, 1) {
     if (Tracing()) LOGI("trace: Swap %X, present %u back %08X data %08X", a[0], uint32_t(g_presents), g_buffers[1], R32(g_buffers[1] + 4));
     app::SplashFirstFrame();
-    if (g_on_swap && a[0] != 4) g_on_swap();
     // handed over from the previous instance: the window opens on the second frame, the first picture with
     // anything drawn over it right after
     if (app::HandingOver() && g_presents >= 2) {
@@ -740,7 +738,8 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    // null keeps the stored viewport, as the library does
+    if (v) g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
     g_state.scissor_count = 0;
     UpdateViewportConstants();
     return 0;
@@ -1313,7 +1312,16 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
              g_state.textures[0] ? R32(g_state.textures[0] + 4) : 0, g_state.vs_handle);
         TraceInputs(a[1]);
     }
-    if (g_backend && !SkipDraw() && !Hidden()) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
+    bool left_out = false;
+    if (d3d::g_vertices_draw_hook && g_state.vs) {
+        const auto& in = g_state.vs->inputs[1];
+        if (in.stream >= 0 && g_state.streams[size_t(in.stream)].vb) {
+            const auto& st = g_state.streams[size_t(in.stream)];
+            left_out = d3d::g_vertices_draw_hook(a[0], a[1], a[2], mem::VirtualFromPhysical(R32(st.vb + 4)) + in.offset,
+                                                 st.stride);
+        }
+    }
+    if (g_backend && !SkipDraw() && !Hidden() && !left_out) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
     return 0;
 }
 
@@ -1323,6 +1331,13 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     SyncProgram();
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
+    if (d3d::g_indexed_draw_hook && g_state.vs && a[2]) {
+        const auto& in = g_state.vs->inputs[1];
+        if (in.stream >= 0 && g_state.streams[size_t(in.stream)].vb) {
+            const auto& st = g_state.streams[size_t(in.stream)];
+            d3d::g_indexed_draw_hook(a[1], a[2], mem::VirtualFromPhysical(R32(st.vb + 4)) + in.offset, st.stride);
+        }
+    }
     if (Tracing()) {
         LOGI("trace: DrawIndexed prim %u count %u rt %08X t0 %08X indices %08X vs %08X", a[0], a[1], g_state.rt.data,
              g_state.textures[0] ? R32(g_state.textures[0] + 4) : 0, a[2], g_state.vs_handle);
@@ -1485,16 +1500,7 @@ void ApplyVisibilityMethod(uint32_t m, uint32_t v) {
     if (m == gpu::kMCountEnable) g_state.simple[gpu::kMCountEnable >> 2] = v;
     if (!g_backend) return;
     if (m == gpu::kMClearReport) g_backend->ClearReport();
-    if (m == gpu::kMGetReport) {
-        uint32_t va = mem::VirtualFromPhysical(v & kReportAddressMask);
-        // a co-op session: the host GPU's counts differ between machines (and arrive whenever its frame is done), so a
-        // test is answered at once with no pixels, the same on both
-        if (lockstep::Active()) {
-            W32(va, 0), W32(va + 4, 0), W32(va + 8, 0), W32(va + 12, 0);
-        } else {
-            g_backend->GetReport(va);
-        }
-    }
+    if (m == gpu::kMGetReport) g_backend->GetReport(mem::VirtualFromPhysical(v & kReportAddressMask));
 }
 
 // draws the open primitive: the slots it wrote are FLOAT4 inputs of the bound program, or of the fixed pipeline

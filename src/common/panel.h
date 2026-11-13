@@ -14,7 +14,6 @@ void Ui(double fps);  // render thread, each frame inside the ImGui frame
 bool Message(unsigned msg, uintptr_t wp, intptr_t lp, intptr_t* result);
 void Toggle();  // any thread
 bool Open();
-void ShowCoop();  // opened at the Co-op page (an online game to join wants its address)
 // a pad poll, after the keyboard's: the game sees the pad idle, while the panel is open and after it until what
 // closed it is let go
 bool Holds(int port, const input::Pad& pad);

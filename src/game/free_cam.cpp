@@ -1,5 +1,5 @@
 // The free camera: F6 (or Back with the right stick clicked) leaves the body where it stands and flies the view through
-// the level, the player unhurt while it is out. Not in Arcade, a network game or an online co-op session: Story only.
+// the level, the player unhurt while it is out. Not in Arcade or a network game: Story only.
 //
 // The view: the player's camera ([0x7B0CC0]) is updated by sub_000CCAB0, which places it (+0x27C), points it (+0x334,
 // with +0x328 the point looked at, +0x358 a copy of the direction and +0x370 up x direction) and finds the room it is
@@ -42,7 +42,6 @@
 #include "core/log.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -74,7 +73,7 @@ bool Valid(uint32_t va, uint32_t size) {
 }
 float& F(uint32_t va) { return kernel::G<float>(va); }
 bool Story() { return ((kernel::R32(kGameMode) >> 8) & 0xFF) == 10; }
-bool NetworkGame() { return game::FovLocked() || lockstep::Active(); }
+bool NetworkGame() { return game::FovLocked(); }
 uint32_t FirstPlayer() {
     uint32_t first = kernel::R32(kPlayerArray);
     return kernel::R32(kPlayers) && Valid(first, kPlayerSize) ? first : 0;

@@ -1,10 +1,10 @@
-// Network diagnostics: while this game is in a System Link game (its lobby or a match) or an online co-op session
-// (net/lockstep.h), logs/net-host.log or logs/net-guest.log says what the network and the game do, for a look at the
+// Network diagnostics: while this game is in a System Link game (its lobby or a match),
+// logs/net-host.log or logs/net-guest.log says what the network and the game do, for a look at the
 // host's and a guest's side by side. The one before stays as net-host.1.log (net-guest.1.log).
 //
 // - events: the menus' and the session's state each time a part of it changes (the menu mode, the session, its role and
 //   lobby state, the game type and map, the players here and in the match);
-// - every second: the datagrams and bytes to and from each peer (xdk/xnet.h), the lockstep session's line;
+// - every second: the datagrams and bytes to and from each peer (xdk/xnet.h);
 // - every second in a level: the game's characters [0x7A3580] (count [0x74C37C]), each by its slot in the actor pool
 //   [0x7356D8] (0xEA0 each; humans first, then bots or the level's AI), its body's place (+0x64) and health (+0x1CC):
 //   a count and a hash each second, the whole list every 5;
@@ -28,7 +28,6 @@
 
 #include "core/log.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
 #include "xdk/hle.h"
 #include "xdk/xnet.h"
 
@@ -70,11 +69,10 @@ auto g_start = std::chrono::steady_clock::now();
 bool SystemLink() { return R32(kSessionUp) != 0; }
 bool Network() {
     uint32_t mode = R32(kMenuMode);
-    return lockstep::Active() || SystemLink() || (mode >= 0xB && mode <= 0xD);
+    return SystemLink() || (mode >= 0xB && mode <= 0xD);
 }
 // "host", "guest" or empty while it is not known
 const char* Role() {
-    if (lockstep::Active()) return lockstep::LocalPort() == 0 ? "host" : "guest";
     if (!SystemLink()) return "";
     uint32_t role = R32(kRole);
     return role == 1 ? "host" : role == 2 ? "guest" : "";
@@ -91,7 +89,7 @@ void Open(const char* role) {
     if (!g_file) return;
     LOGR("netdiag: %s", path.string().c_str());
     std::fprintf(g_file, "TSFP network diagnostics, this game the %s%s\n", role,
-                 lockstep::Active() ? " of an online co-op session (lockstep)" : " of a System Link game");
+                 " of a System Link game");
     for (const std::string& line : g_early) std::fputs(line.c_str(), g_file);
     g_early.clear();
     std::fflush(g_file);
@@ -107,7 +105,7 @@ void Line(const char* fmt, ...) {
     double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
     char line[2200];
     std::snprintf(line, sizeof line, "[%9.3f] f %llu tick %u | %s\n", t,
-                  static_cast<unsigned long long>(lockstep::Active() ? lockstep::Frame() : g_frames), R32(kTick), msg);
+                  static_cast<unsigned long long>(g_frames), R32(kTick), msg);
     if (g_file) {
         std::fputs(line, g_file);
         g_dirty = true;
@@ -145,7 +143,6 @@ Watch g_watch[] = {
     {"network players (mask)", NetPlayers},
     {"match humans", [] { return uint32_t(Byte(kPlayConfig)); }},
     {"match bots", [] { return uint32_t(Byte(kPlayConfig + 2)); }},
-    {"lockstep", [] { return uint32_t(lockstep::Active()); }},
 };
 
 void Events() {
@@ -155,9 +152,6 @@ void Events() {
         Line("%s: %d%s", w.name, int32_t(v), w.seen ? "" : " (at start)");
         w.last = v, w.seen = true;
     }
-    static std::string notice;
-    std::string now = lockstep::Active() ? lockstep::Notice() : std::string();
-    if (now != notice) Line("lockstep notice: %s", now.empty() ? "(none)" : now.c_str()), notice = now;
 }
 
 // ---- the characters ----
@@ -289,7 +283,7 @@ void Second();
 
 namespace game {
 
-// the game's frame starts (main thread, game/coop_online.cpp's frame clock)
+// the game's frame starts (main thread, game/frame_clock.cpp)
 void NetDiagFrame() {
     if (!g_file && !Network()) {
         g_frames = 0;
@@ -309,13 +303,12 @@ namespace {
 
 void Second() {
     Line("traffic: %s", xnet::TrafficLine().c_str());
-    if (lockstep::Active()) Line("lockstep: %s", lockstep::Status().c_str());
-    bool in_level = lockstep::Active() ? R32(kCharacterCount) != 0 : SystemLink() && R32(kLobbyState) == kInGame;
+    bool in_level = SystemLink() && R32(kLobbyState) == kInGame;
     if (in_level) {
         Snapshot s = Characters();
         Line("characters %u hash %08X", s.count, Hash(s));
         if (g_frames % (kEvery * kListEvery) == 0) LogList(s);
-        if (SystemLink() && !lockstep::Active()) {
+        if (SystemLink()) {
             Packet p{kTag, R32(kRole), uint32_t(g_frames), s};
             xnet::SideSend(&p, sizeof p);
             Compare(s);

@@ -4,7 +4,6 @@
 #include <queue>
 
 #include "kernel/kernel.h"
-#include "net/lockstep.h"
 
 namespace kernel {
 
@@ -208,9 +207,6 @@ static void Consume(Object& o, uint32_t me) {
 
 int64_t Now100ns() {
     using namespace std::chrono;
-    // in a co-op session the game's time from 1 January 2005, the same on both machines
-    constexpr int64_t k2005 = 127490112000000000ll;
-    if (lockstep::Active()) return k2005 + int64_t(lockstep::Now100ns());
     // 1601 to 1970 in 100 ns units
     auto t = duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
     return t / 100 + 116444736000000000ll;

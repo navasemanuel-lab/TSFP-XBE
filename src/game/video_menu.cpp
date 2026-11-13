@@ -3,8 +3,8 @@
 // Future Perfect PC port's Display settings, TheDoffman/timesplitters-future-perfect-pc). Accept applies and saves
 // them, Cancel and Back leave them as they were. The field of view rows are the player's who opened the menu: in a
 // split screen each player pauses on their own part of it, and their angles are theirs alone. In System Link and
-// online play the field of view rows are not there. In online co-op the menu is not: both machines play the same
-// menus, and the choices are each machine's own (F1). The game's Audio/Video Options has only sound rows and
+// online play the field of view rows are not there.
+// The game's Audio/Video Options has only sound rows and
 // subtitles: it is named Audio Options. The render scale and the two fields of view are bars, as the audio volumes: the
 // left and right keys step them, a held click sets them, the value in the row's caption.
 #ifndef WIN32_LEAN_AND_MEAN
@@ -27,7 +27,6 @@
 #include "common/options.h"
 #include "core/log.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
@@ -41,7 +40,6 @@ void ApplyScreenShape();  // game/fov.cpp
 // game/menu_layout.cpp: f run with the menu letters at this menu's smaller scale
 void WithVideoText(X86Context& ctx, const std::function<void()>& f);
 void AddUnlockRow(X86Context& ctx, uint32_t caller);  // game/unlock_menu.cpp
-bool StoryOnlineRow(X86Context& ctx);                  // game/story_online.cpp
 uint32_t MansionText(uint32_t id);                     // game/mansion_cut.cpp
 void NoteMenuBar(uint32_t menu, uint32_t row, float x, float y, float w, float h,
                  void (*set)(uint32_t id, float at));  // game/menu_mouse.cpp
@@ -231,7 +229,7 @@ std::string ModeText(uint32_t w, uint32_t h) {
 // the desktop's, then the monitor's modes and the common sizes, largest first
 std::vector<std::pair<uint32_t, uint32_t>> ListModes() {
     std::vector<std::pair<uint32_t, uint32_t>> modes(1, {0, 0});
-    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(app::Window()), MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR mon = static_cast<HMONITOR>(app::TargetMonitor());  // the monitor setting's, where the window goes
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     std::vector<std::pair<uint32_t, uint32_t>> found(std::begin(kPresets), std::end(kPresets));
@@ -323,7 +321,8 @@ void Accept() {
     s.display_mode = mode;
     s.width = w;
     s.height = h;
-    s.render_percent = g_value[kRender];
+    // the bar stops at 200%: a higher scale set in F1 stays unless the bar was moved
+    if (g_value[kRender] != std::clamp<uint32_t>(s.render_percent, 1, 200)) s.render_percent = g_value[kRender];
     s.aspect = pick[kAspect];
     s.vsync = pick[kVsync] == 1;
     s.aniso = g_rows[kFiltering].values[pick[kFiltering]];
@@ -471,15 +470,12 @@ std::string DisplayModeName(uint32_t w, uint32_t h) { return ModeText(w, h); }
 // View Gallery)
 X86_EXTERN_FUNC(__imp__sub_00079D60);
 X86_FUNC(sub_00079D60) {
-    uint32_t caller = kernel::R32(ctx.esp), slot = ctx.esp + 20, callback = kernel::R32(slot);
+    uint32_t caller = kernel::R32(ctx.esp), callback = kernel::R32(ctx.esp + 20);
     bool settings = caller == kFromSettings && callback == kSettingsAudio;
     bool paused = caller == kFromPause && callback == kPauseAudio;
-    bool story = game::StoryOnlineRow(ctx);  // the main menu's Story row opens Local / Online
     __imp__sub_00079D60(ctx, base);
-    if (story) kernel::W32(slot, 0);
     game::AddUnlockRow(ctx, caller);
-    // not in online co-op: both machines run the menus, which would set one player's display on both (F1 instead)
-    if (!(settings || paused) || lockstep::Active() || !Prepare()) return;
+    if (!(settings || paused) || !Prepare()) return;
     kernel::CallGuest(ctx, kAddRow, {g_row_text, 0xFFFFFFFF, 0, 0, g_open_cb, 0});
 }
 

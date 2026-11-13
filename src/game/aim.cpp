@@ -2,10 +2,6 @@
 // The current player's view angles are degrees, yaw at +0x100 (lower is right) and pitch at +0x104 (higher is up).
 // The counts are applied as the frame's movement is built from the yaw (0xD2B80), after the stick's look step, so a
 // step and a turn in the same frame agree.
-//
-// In an online co-op session (net/lockstep.h) each player turns by their own machine's mouse, the turn sent with their
-// controls, sensitivity applied: both machines turn both players alike, and what decides a turn here is the game and
-// the session, never this machine's mouse or settings.
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -19,7 +15,6 @@
 #include "common/options.h"
 #include "core/log.h"
 #include "kernel/memory.h"
-#include "net/lockstep.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -30,6 +25,7 @@ constexpr uint32_t kPitchLimit = 0x7B0C80;  // degrees up or down
 constexpr uint32_t kPauseState = 0x761C48;  // the pause screen's state: +0 bit 0 up
 constexpr uint32_t kSlot = 0x4;             // the local input slot; +0 is a player id, not the pad
 constexpr uint32_t kYaw = 0x100, kPitch = 0x104;
+constexpr uint32_t kMechState = 0x8000;    // the Battle Mech (Machine Wars): its own step 0x37AA70
 constexpr uint32_t kGoliathState = 0x100;  // the Goliath walker's seat
 constexpr uint32_t kState = 0x114;          // 0x80 a mounted gun, 0x40 0x20 0x100 0x200 0x400 views of their own
 constexpr uint32_t kFlags = 0xC;            // bit 7: the view turns whatever the camera
@@ -43,33 +39,23 @@ constexpr float kPi = 3.14159265f;
 float F(uint32_t va) { return std::bit_cast<float>(kernel::R32(va)); }
 void SetF(uint32_t va, float v) { kernel::W32(va, std::bit_cast<uint32_t>(v)); }
 
-bool Session() { return lockstep::Active(); }
-// a player the mouse turns: the first input slot's, in a session either player's
-bool MouseSlot(uint32_t slot) { return Session() ? slot < uint32_t(lockstep::kPlayers) : slot == 0; }
-
-// the keyboard and mouse player: the current player on the first input slot (in a session, either)
+// the keyboard and mouse player: the current player on the first input slot
 uint32_t LocalPlayer() {
     uint32_t player = kernel::R32(kPlayer);
-    return player && MouseSlot(kernel::R32(player + kSlot)) ? player : 0;
+    return player && kernel::R32(player + kSlot) == 0 ? player : 0;
 }
 // this machine's own player, for what only shows here (the cursor, the wheel's zoom)
-bool Own(uint32_t player) {
-    return player && kernel::R32(player + kSlot) == uint32_t(Session() ? lockstep::LocalPort() : 0);
-}
+bool Own(uint32_t player) { return player && kernel::R32(player + kSlot) == 0; }
 // the player plays on the keyboard and mouse
-bool PlayerKeyboard(uint32_t player) {
-    return Session() ? player && lockstep::PortKeyboard(int(kernel::R32(player + kSlot))) : controls::KeyboardActive();
-}
-// the player's mouse counts this frame: this machine's, or in a session the frame's from the network
-bool TakeCounts(uint32_t player, float& dx, float& dy) {
-    if (!Session()) return !game::FreeCamOn() && mouse::TakeMotion(dx, dy);  // the free camera's while it flies
-    return player && lockstep::PortAim(int(kernel::R32(player + kSlot)), dx, dy) && (dx != 0 || dy != 0);
-}
+bool PlayerKeyboard(uint32_t) { return controls::KeyboardActive(); }
+// the player's mouse counts this frame; the free camera's while it flies
+bool TakeCounts(uint32_t, float& dx, float& dy) { return !game::FreeCamOn() && mouse::TakeMotion(dx, dy); }
 
 // the view's own turning: the states the look update turns the view in
 bool ViewTurns(uint32_t player) {
     uint32_t state = kernel::R32(player + kState);
-    if (state == 0x80 || state == 0x40 || state == 0x20 || state == 0x100 || state == 0x2000 || state == 0x10000)
+    if (state == 0x80 || state == 0x40 || state == 0x20 || state == 0x100 || state == 0x2000 || state == 0x10000 ||
+        state == kMechState)
         return false;
     if (kernel::R32(player + kFlags) & 0x80) return true;
     uint32_t cam = kernel::R32(kCamera);
@@ -113,11 +99,9 @@ bool Paused() {
     return pause >= 0x10000 && mem::IsCommitted(pause) && (kernel::R32(pause) & 1);
 }
 
-// a session's counts come with the sending machine's sensitivity, up and down share and inversion applied
-float Step() { return kDegreesPerCount * (Session() ? 1.0f : float(game::Opt().mouse_sensitivity) / 100.0f); }
+float Step() { return kDegreesPerCount * float(game::Opt().mouse_sensitivity) / 100.0f; }
 // the vertical counts as they turn things up: mouse up is up, unless inverted
 float Vertical(float dy) {
-    if (Session()) return dy;
     const game::Options& o = game::Opt();
     return dy * float(o.mouse_vertical) / 100.0f * (o.invert_mouse ? -1.0f : 1.0f);
 }
@@ -146,6 +130,7 @@ void TurnMounted(uint32_t angles, float scale) {
 
 // A terminal (U-Genix's): its pointer at +0x38 and +0x3C in 0-255 units, moved by the counts as the stick moves it, and
 // the left button is its A. After the TimeSplitters Future Perfect PC port.
+constexpr float kTerminalSpeed = 3.0f;
 constexpr uint32_t kTerminalState = 0x2000, kTerminalSlots = 0x76C27C, kTicks = 0x4E7944;
 void TerminalMouse(uint32_t player) {
     float dx, dy;
@@ -160,7 +145,8 @@ void TerminalMouse(uint32_t player) {
     if (!Valid(descriptor, 0x18) || (kernel::R32(descriptor + 0x14) & 4) || !kernel::R32(kTicks)) return;
     float x = F(t + 0x38), y = F(t + 0x3C);
     if (!std::isfinite(x) || !std::isfinite(y)) return;
-    float step = Step();
+    // the pointer crosses its 256 units in far fewer counts than a view turns: three times the view's step
+    float step = Step() * kTerminalSpeed;
     SetF(t + 0x38, std::clamp(x + dx * step, 4.0f, 251.0f));
     SetF(t + 0x3C, std::clamp(y + dy * step, 4.0f, 251.0f));
     kernel::W32(t + 0x20, 0);  // the idle timer the stick resets
@@ -168,7 +154,13 @@ void TerminalMouse(uint32_t player) {
 
 // the states a hook here turns 1:1; the others with a view of their own (a tank, a railbot, a big gun) take the mouse
 // as the right stick (mouse.cpp VehicleStick)
-bool TurnedHere(uint32_t state) { return state == 0 || state == 0x80 || state == 0x40 || state == 0x2000 || state == 0x10000; }
+constexpr uint32_t kWalkerStep = 0x21C900;  // the Machine Wars mech's own camera step, set at player+0x157C in state 0x100
+bool TurnedHere(uint32_t state) {
+    uint32_t player = kernel::R32(kPlayer);
+    if (state == kGoliathState && player && kernel::R32(player + 0x157C) == kWalkerStep) return true;  // turned in its step (below)
+    return state == 0 || state == 0x80 || state == 0x40 || state == 0x2000 || state == 0x10000 || state == kMechState ||
+           false;  // state 0x100 (the Battle Mech) turns by its own script's step: the mouse is its right stick
+}
 // A vehicle or gun's own step either adds the stick to the player's angles each frame (a tank's turret, a railbot) or
 // sets them from the stick's tilt. Which one is learned the first time the mouse moves in it: the counts are added
 // before the step, and kept by it they turn it 1:1 from then on; lost, the mouse is the right stick there.
@@ -181,8 +173,22 @@ uint64_t VehicleKey(uint32_t player) {
     return uint64_t(kernel::R32(player + kState)) << 32 | handle;
 }
 
+// the tank's seats turn 1:1 in their own step (below): the mouse must not also be the right stick there, which takes
+// the same counts first. Steady clock ms of the last step in a seat.
+std::atomic<int64_t> g_seat_ms{0};
+int64_t SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 void MarkVehicle(uint32_t player) {
-    if (player && g_vehicle_turn[VehicleKey(player)] == VehicleTurn::Direct) return;
+    // not yet learned: the 1:1 turn is tried first, and the mouse as the stick would take its counts from the poll
+    // thread (g_vehicle_ms keeps the stick on for a moment, so it is only asked once learned)
+    if (player && g_vehicle_turn[VehicleKey(player)] != VehicleTurn::Stick) {
+        if (Own(player) && !TurnedHere(kernel::R32(player + kState)) && !ViewTurns(player) && !Paused()) mouse::Aiming();
+        return;
+    }
+    if (SteadyMs() - g_seat_ms < 250) return;
     // only where the view does not turn itself: on foot some states (crouching, jumping) are not 0 either
     if (player && Own(player) && !TurnedHere(kernel::R32(player + kState)) && !ViewTurns(player) && !Paused()) {
         mouse::InVehicle();
@@ -339,19 +345,28 @@ X86_FUNC(sub_000D5C70) {
         static uint32_t last_state = 0;
         static TankSeat last_seat = TankSeat::None;
         uint32_t state = kernel::R32(player + kState);
-        if (state != last_state || seat != last_seat)
-            LOGR("aim: mounted state %X, %s", state,
-                 seat == TankSeat::Driver ? "a vehicle's driver" : seat == TankSeat::Gunner ? "a vehicle's gunner" : "no seat");
+        static uint32_t last_callback = 0;
+        uint32_t callback = state == 0x100 ? kernel::R32(player + 0x157C) : 0;
+        if (state != last_state || seat != last_seat || callback != last_callback)
+            LOGR("aim: mounted state %X, %s (input slot %u, %u players, step %08X, data %08X flags %X)", state,
+                 seat == TankSeat::Driver ? "a vehicle's driver" : seat == TankSeat::Gunner ? "a vehicle's gunner" : "no seat",
+                 kernel::R32(player + kSlot), kernel::R32(kPlayers), callback, kernel::R32(player + 0x1580),
+                 kernel::R32(player + 0x1578));
         last_state = state;
         last_seat = seat;
+        last_callback = callback;
     }
+    if (Own(player) && kernel::R32(player + kState) == kGoliathState && !Paused()) mouse::Aiming();  // the mouse stays captured
+    if (seat != TankSeat::None && Own(player)) g_seat_ms = SteadyMs();
     if (seat == TankSeat::Gunner && Own(player)) mouse::Aiming();
     if (seat == TankSeat::Driver) {
         float dx, dy;
         float yaw = F(player + kYaw), pitch = F(player + kPitch);
         if (TakeTurn(player, dx, dy) && std::isfinite(yaw) && std::isfinite(pitch)) {
             float step = Step() * ZoomScale();
-            SetF(player + kYaw, yaw - dx * step);
+            // the angle stays in [0, 360) as the game keeps it, so turning a full circle comes back to the same heading
+            float turned = std::remainder(yaw - dx * step, 360.0f);
+            SetF(player + kYaw, turned < 0 ? turned + 360.0f : turned);
             SetF(player + kPitch, pitch + Vertical(dy) * step);  // the barrel: lower is up
         }
     }
@@ -367,6 +382,7 @@ X86_FUNC(sub_000D5C70) {
     if (player && player == LocalPlayer() && !TurnedHere(kernel::R32(player + kState)) && !ViewTurns(player) &&
         !Paused()) {
         turn = &g_vehicle_turn[VehicleKey(player)];
+        if (kernel::R32(player + kState) == kGoliathState) *turn = VehicleTurn::Stick;  // its step reads the stick, not the player's angles
         float dx, dy;
         if (*turn != VehicleTurn::Stick) {
             if (Own(player)) mouse::Aiming();
@@ -395,6 +411,47 @@ X86_FUNC(sub_000D5C70) {
         LOGI("aim: vehicle state %X turns %s", kernel::R32(player + kState),
              *turn == VehicleTurn::Direct ? "1:1 with the mouse" : "by the stick, the mouse tilts it");
     }
+}
+
+// The Battle Mech (state 0x8000): its step 0x37AA70 (arg 3 the stick's look) adds the stick to the mech's target angles,
+// pitch at +0x2C (-80 up to 10 down, lower is up) and yaw at +0x30 (0 to 360, lower is right), in the mech's data
+// (scene 0xC9F50 -> +0x2AC actor -> +0x7C -> +0xAA0; +0x50 set while the player has it, +0x9C the input slot). The
+// mouse turns those targets 1:1 before the step, the pitch held to the mech's arc so a big move cannot jump it.
+// After the TimeSplitters Future Perfect PC port.
+X86_EXTERN_FUNC(__imp__sub_0037AA70);
+X86_FUNC(sub_0037AA70) {
+    uint32_t player = kernel::R32(kPlayer);
+    uint32_t seat_state = player ? kernel::R32(player + kState) : 0;
+    if (seat_state == kMechState || seat_state == kGoliathState) {
+        uint32_t scene = kernel::CallGuest(ctx, 0xC9F50, {});
+        uint32_t actor = Valid(scene, 0x2B0) ? kernel::R32(scene + 0x2AC) : 0;
+        uint32_t extra = Valid(actor, 0x80) ? kernel::R32(actor + 0x7C) : 0;
+        uint32_t mech = Valid(extra, 0xAA4) ? kernel::R32(extra + 0xAA0) : 0;
+        if (Own(player)) mouse::Aiming();
+        float dx, dy;
+        bool mine = Valid(mech, 0xA0) && kernel::R32(mech + 0x50) && kernel::R32(mech + 0x9C) == kernel::R32(player + kSlot);
+        static int last_mine = -1;
+        if (Own(player) && int(mine) != last_mine) {
+            last_mine = int(mine);
+            LOGR("aim: battle mech (state %X) %s: mech %08X on %08X, in use %u, slot %u of %u", seat_state,
+                 mine ? "turned by the mouse" : "not taken", mech, extra, mech ? kernel::R32(mech + 0x50) : 0,
+                 mech ? kernel::R32(mech + 0x9C) : 0, kernel::R32(player + kSlot));
+        }
+        if (mine && TakeTurn(player, dx, dy)) {
+            float pitch = F(mech + 0x2C), yaw = F(mech + 0x30);
+            if (std::isfinite(pitch) && std::isfinite(yaw)) {
+                float step = Step() * ZoomScale();
+                // the game keeps the pitch in [0, 360): up is 280..360, down 0..10; held as a signed angle here
+                if (pitch > 180.0f) pitch -= 360.0f;
+                pitch = std::clamp(pitch + Vertical(dy) * step, -80.0f, 10.0f);
+                yaw = std::remainder(yaw - dx * step, 360.0f);
+                if (yaw < 0) yaw += 360.0f;
+                SetF(mech + 0x2C, pitch);
+                SetF(mech + 0x30, yaw);
+            }
+        }
+    }
+    __imp__sub_0037AA70(ctx, base);
 }
 
 // MoveVectors(): the frame's movement from the camera yaw
@@ -471,18 +528,6 @@ X86_FUNC(sub_0025D520) {
 
 namespace game {
 
-// a session's frame of this machine's mouse (net/lockstep.h): the counts with its sensitivity, up and down share and
-// inversion applied, so the machines turn by the same numbers
-bool TakeMouseTurn(float& dx, float& dy) {
-    float x, y;
-    if (!mouse::TakeMotion(x, y)) return false;
-    const Options& o = Opt();
-    float k = float(o.mouse_sensitivity) / 100.0f;
-    dx = x * k;
-    dy = y * k * float(o.mouse_vertical) / 100.0f * (o.invert_mouse ? -1.0f : 1.0f);
-    return true;
-}
-
 // in the Goliath (mounted state 0x100) its minigun is the left trigger's: the right button fires it. A step within the
 // last quarter second counts, so leaving it gives the button back to the aim
 bool RightButtonFiresLeftTrigger() {
@@ -492,3 +537,33 @@ bool RightButtonFiresLeftTrigger() {
 }
 
 }  // namespace game
+
+// The Machine Wars mech's camera step (state 0x100, called through the callback at player+0x157C = 0x21C900): the pad's
+// right stick (axis 0x10 up and down, 0x11 around, read by 0xCF200) turns two angles in the globals, in degrees, added
+// each frame at most 1 (pitch) and 2 (yaw) and wrapped to [0, 360): pitch [0x75C100] held by the step to
+// 280..360 and 0..60 (so -80 to 60 as a signed angle), yaw [0x75C0FC]. Signs as tried in the game: the mouse's counts
+// go in against the first reading of the code (the first build, added as read, turned both axes the wrong way). The mouse as the right stick
+// was held to a full tilt (about 60 degrees a second); the mouse's counts are added to the angles here instead, 1:1
+// as on foot, before the step clamps them.
+constexpr uint32_t kWalkerPitch = 0x75C100, kWalkerYaw = 0x75C0FC;
+X86_EXTERN_FUNC(__imp__sub_0021C900);
+X86_FUNC(sub_0021C900) {
+    uint32_t player = kernel::R32(kPlayer);
+    if (player && player == LocalPlayer() && kernel::R32(player + kState) == kGoliathState) {
+        float dx, dy;
+        if (TakeTurn(player, dx, dy)) {
+            float pitch = F(kWalkerPitch), yaw = F(kWalkerYaw);
+            if (std::isfinite(pitch) && std::isfinite(yaw)) {
+                float step = Step() * ZoomScale();
+                if (pitch > 180.0f) pitch -= 360.0f;
+                pitch = std::clamp(pitch - Vertical(dy) * step, -80.0f, 60.0f);
+                if (pitch < 0) pitch += 360.0f;
+                yaw = std::remainder(yaw - dx * step, 360.0f);
+                if (yaw < 0) yaw += 360.0f;
+                SetF(kWalkerPitch, pitch);
+                SetF(kWalkerYaw, yaw);
+            }
+        }
+    }
+    __imp__sub_0021C900(ctx, base);
+}

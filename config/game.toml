@@ -388,3 +388,1122 @@ call = "MapMakerGhostOption"
 [[hook]]
 at = 0x2422DE
 call = "MapMakerGhostSpawner"
+
+# >>> native frame rate (tools/native_hooks.py)
+[[hook]]
+at = 0x67B32
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0xA75E7
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xBB6C0
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xC73C0
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xC7610
+call = "NativeGateDx"
+after = true
+[[hook]]
+at = 0xC7D73
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xC7E0C
+call = "NativeGateDx"
+after = true
+[[hook]]
+at = 0xCA040
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xCD70F
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0xCEA8D
+call = "NativeGateCx"
+after = true
+[[hook]]
+at = 0xD5B0C
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0xD5EBF
+call = "NativeGateCx"
+after = true
+[[hook]]
+at = 0xED3B6
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0xF0158
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0xF4A66
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x108793
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x10F10A
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x11F9AA
+call = "NativeGameFild"
+after = true
+[[hook]]
+at = 0x125BF6
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x126047
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x1260C0
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x1442FD
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x144414
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1447AB
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x14A5CD
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x15EB0C
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x164E00
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x166899
+call = "NativeGateDi"
+after = true
+[[hook]]
+at = 0x172AB5
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x17DA03
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x17E6C3
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x186FFA
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x187037
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x187069
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x187097
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x187212
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x18727D
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18732D
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x187483
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x188AB2
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x188ADF
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x188B0C
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x188B35
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x188B5E
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x188B84
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1891A1
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x189267
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18B355
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x18B5F2
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x18B62C
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x18B656
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x18B7D0
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18BAEF
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18BB50
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x18BE87
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x18C060
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18C289
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x18D156
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x18D372
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D62C
+call = "NativeGameXmm5"
+after = true
+[[hook]]
+at = 0x18D675
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x18D69E
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x18D6EC
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x18D712
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x18D797
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D7CE
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x18D7FB
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x18D83C
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D869
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D902
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x18D92F
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x18D959
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x18D97A
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D9A7
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18D9D1
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DA35
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DA80
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DAB0
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DAE0
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DC40
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DC86
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DD30
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DD71
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x18DEE6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1B6FF0
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x1D77DE
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x1D88B0
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x1D8AF5
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1D8B6A
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x1D8E72
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1D8EEA
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1DB1DE
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1DB231
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1DB6A6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1DB78D
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1DB7CF
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DBC21
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DBD57
+call = "NativeGameXmm5"
+after = true
+[[hook]]
+at = 0x1DBD84
+call = "NativeGameXmm5"
+after = true
+[[hook]]
+at = 0x1DBDB3
+call = "NativeGameXmm5"
+after = true
+[[hook]]
+at = 0x1DBDE2
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x1DBE13
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DBE42
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DCE33
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DD545
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1DD6D1
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1DF90F
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1E11B9
+call = "NativeRawXmm0"
+after = true
+[[hook]]
+at = 0x1E1262
+call = "NativeRawXmm1"
+after = true
+[[hook]]
+at = 0x1E1293
+call = "NativeRawXmm1"
+after = true
+[[hook]]
+at = 0x1E131C
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1E197A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1E19B7
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1E19F3
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1E1A24
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1E1A63
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1E20B0
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1E2681
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1E27A6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EA6B2
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EA6D6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EB25B
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1EB2AD
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EB6B4
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EB7A7
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EBFBE
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EC01A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EC126
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1ECE13
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1ECE42
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EE2B8
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EE5C3
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EE619
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1EFBF7
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1EFC24
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F3542
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1F3619
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1F3C30
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F3CDC
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F3F83
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x1F4582
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F45C6
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F46A3
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F9E1A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1F9EB5
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FD9BD
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FE1C9
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FE1F2
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FE21A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FE244
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x1FE26E
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x1FE438
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2005C8
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x200633
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x200987
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2010B8
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x201182
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x2011A9
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2011CF
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2023C0
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2024E2
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2031C6
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x20394B
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203A7A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x203AA7
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x203BA5
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x203BDB
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203C0E
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203C41
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203C6B
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203C95
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x203CE7
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x203D14
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203D41
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203D73
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203D9C
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203DC5
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203E10
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x203E3D
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203E6A
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203E97
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203EC0
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203EEE
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203F39
+call = "NativeGameXmm6"
+after = true
+[[hook]]
+at = 0x203F66
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203F93
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x203FC0
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x203FEC
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x204012
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x205D87
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x206471
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x20657D
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x207C74
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x208B37
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x20935D
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2109E5
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x211684
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x2116B6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2116E3
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x211AF6
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x212315
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x212D42
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2148DF
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x216958
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x217059
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x218815
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x21A432
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x21AF90
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x21B070
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x222B60
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x224170
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x2262E7
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x228880
+call = "NativeGateAx"
+after = true
+[[hook]]
+at = 0x22F6DE
+call = "NativeRawXmm1"
+after = true
+[[hook]]
+at = 0x24B190
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x24B256
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x24B29E
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x24B314
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24B348
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x24B376
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x24B3A1
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24B44A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24B476
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24B4A4
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24B4CF
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x24B969
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24BA95
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x24BF22
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x24DDE9
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x24DE23
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x24DE8E
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24DEB9
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24DEEB
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24DFC4
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x24EAF4
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x255097
+call = "NativeGameFild"
+after = true
+[[hook]]
+at = 0x255102
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x258347
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x288089
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2880B2
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2880DB
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x288105
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x288139
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x288641
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x288685
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2886C3
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x2886F0
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x28872C
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x2B93DA
+call = "NativeGateCx"
+after = true
+[[hook]]
+at = 0x31F47B
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x363F4C
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x363F82
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x3647A0
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x365AA3
+call = "NativeGameXmm3"
+after = true
+[[hook]]
+at = 0x369C04
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x369C35
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x369C5D
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x369C87
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x369CB1
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x36A41A
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x36A44D
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x36A47F
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x36E33D
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x379F8A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37A0C3
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x37A1DF
+call = "NativeGameXmm4"
+after = true
+[[hook]]
+at = 0x37A7DE
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x37A849
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x37A8B8
+call = "NativeGameXmm5"
+after = true
+[[hook]]
+at = 0x37A932
+call = "NativeGameXmm0"
+after = true
+[[hook]]
+at = 0x37BC8A
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37BD91
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37BDC0
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37BE75
+call = "NativeGameXmm2"
+after = true
+[[hook]]
+at = 0x37BFB2
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37C16E
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37C198
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37C1BF
+call = "NativeGameXmm1"
+after = true
+[[hook]]
+at = 0x37C663
+call = "NativeGameXmm1"
+after = true
+# <<< native frame rate

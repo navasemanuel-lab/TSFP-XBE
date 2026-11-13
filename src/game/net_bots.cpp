@@ -33,14 +33,7 @@
 #include "xdk/hle.h"
 #include "xdk/xnet.h"
 
-namespace game {  // game/story_online.cpp
-bool StoryOnline();
-bool StoryOnlineLobbyHeader(X86Context& ctx);
-void StoryOnlineLobbyConfig();
-uint32_t StoryOnlinePlayerLimit();
-bool StoryOnlinePrepare(X86Context& ctx, uint32_t address);
-bool StoryOnlineActorActive(uint32_t caller, uint32_t index, uint32_t entity);
-bool StoryOnlineInLevel();
+namespace game {
 void LogDamage(uint32_t record);  // game/ai_types.cpp
 }  // namespace game
 
@@ -148,13 +141,10 @@ Population Prepare(bool configure) {
 
 // ---- the match ----
 
-// Online Story (game/story_online.cpp): the level's NPCs, every actor after the players, are the host's as bots are
-bool Story() { return game::StoryOnlineInLevel(); }
 uint32_t Humans() { return At(kPlayConfig)[0]; }
-uint32_t Bots() { return Story() ? kActorSlots - std::min(Humans(), kActorSlots) : At(kPlayConfig)[2]; }
+uint32_t Bots() { return At(kPlayConfig)[2]; }
 bool MatchBots() {
     uint32_t h = Humans(), b = Bots();
-    if (Story()) return h && h <= 4;
     return h && b && b <= kRosterSize && h + b <= kSlots;
 }
 bool InGame(uint32_t role) { return R32(kSessionUp) && R32(kRole) == role && R32(kLobbyState) == kInGame; }
@@ -297,43 +287,12 @@ struct Bounds {
     float center[3], radius[3];
 } g_bounds[kActorSlots]{};  // the others: each bot's hit bounds as the host has them
 
-// the others: a Story NPC's body as the host made it (the kind, the variant, the place), where this game's own level
-// made another or none: this game's Story spawns none of its own (0x15DF20 below), the host's states make them
-uint32_t g_making = 0;
 void List(uint32_t actor, bool on);
-uint32_t MakeNpc(X86Context& ctx, uint32_t slot, const State& s) {
-    uint32_t pool = R32(kActors), players = R32(kLevelPlayers);
-    if (!pool || s.kind[0] < 0 || s.kind[1] < 0 || slot < players || slot - players >= 30 || !InGame(2)) return 0;
-    uint32_t actor = pool + slot * kActorSize;
-    if (!Valid(actor, kActorSize)) return 0;
-    if (uint32_t old = R32(actor)) {
-        if (!Valid(old, 0x25C) || R32(old + 0x7C) != actor) return 0;
-        List(actor, false);
-        kernel::CallGuest(ctx, 0xA9070, {old});
-        W32(actor, 0);
-        W32(kAiBodies + (slot - players) * 4, 0);
-    }
-    g_making++;
-    uint32_t body = kernel::CallGuest(ctx, 0xDAC30, {uint32_t(int32_t(s.kind[0])), uint32_t(int32_t(s.kind[1])), slot,
-                                                     U(s.position[0]), U(s.position[1]), U(s.position[2]),
-                                                     U(s.heading), UINT32_MAX, 1, s.variant});
-    g_making--;
-    if (!body || !Valid(body, 0x25C) || R32(actor) != body) return 0;
-    W32(kAiBodies + (slot - players) * 4, body);
-    kernel::CallGuest(ctx, 0xD7570, {actor});
-    if (R32(kNpcCount) < slot - players + 1) W32(kNpcCount, slot - players + 1);
-    return body;
-}
-bool SameKind(uint32_t actor, const State& s) {
-    int16_t kind[2];
-    std::memcpy(kind, At(actor + 0x48), 4);
-    return kind[0] == s.kind[0] && kind[1] == s.kind[1];
-}
 
 // the others: a bot's body made again, as Arcade makes it, after the host's came back to life
 uint32_t Revive(X86Context& ctx, uint32_t slot) {
     uint32_t pool = R32(kActors);
-    if (Story() || !MatchBots() || slot < Humans() || slot >= Humans() + Bots() || !pool || !InGame(2)) return 0;
+    if (!MatchBots() || slot < Humans() || slot >= Humans() + Bots() || !pool || !InGame(2)) return 0;
     uint32_t actor = pool + slot * kActorSize;
     if (!Valid(actor, kActorSize) || R32(actor)) return 0;
     uint32_t character = At(kPlayConfig + 0x14)[slot];
@@ -476,23 +435,17 @@ void Frame(X86Context& ctx) {
     uint32_t pool = R32(kActors);
     if (!Valid(pool, kActorSlots * kActorSize)) return;
     uint32_t humans = Humans(), bots = Bots(), tick = R32(kTick);
-    bool story = Story();
-    static bool announced = false;
-    if (story && !announced) LOGR("netbots: Story's NPCs %s", role == 1 ? "sent to the others" : "taken from the host");
-    announced = story;
     Context(role, MatchId(), humans, bots);
     TidyCharacters();
-    // a Story NPC every other tick: the others' own AI moves it between the host's states
-    uint32_t interval = story ? 2 : kSendTicks;
-    if (role == 1 && sent && tick - last_tick < interval) return;
+    if (role == 1 && sent && tick - last_tick < kSendTicks) return;
     for (uint32_t slot = humans; slot < humans + bots; slot++) {
         uint32_t body = BotBody(slot), actor = pool + slot * kActorSize;
         State s;
         if (role == 2) {
             if (!Take(slot, s)) continue;
-            // the scores outlive the body: this bot's row, and its column of who killed it (Story keeps none)
-            if (!story) std::memcpy(At(actor + 0xA10), s.scores, sizeof s.scores);
-            for (uint32_t killer = 0; killer < humans + bots && !story; killer++) {
+            // the scores outlive the body: this bot's row, and its column of who killed it
+            std::memcpy(At(actor + 0xA10), s.scores, sizeof s.scores);
+            for (uint32_t killer = 0; killer < humans + bots; killer++) {
                 int16_t& seen = seen_kills[slot][killer];
                 if (s.killed_by[killer] < seen) seen = s.killed_by[killer];
                 while (s.killed_by[killer] > seen && KillNotice(ctx, slot, killer)) seen++;
@@ -508,16 +461,9 @@ void Frame(X86Context& ctx) {
                 g_bounds[slot] = {};
                 continue;
             }
-            if (story && body && Valid(body, 0x2E8) && !SameKind(actor, s)) {
-                int16_t kind[2];
-                std::memcpy(kind, At(actor + 0x48), 4);
-                LOG_FIRST(20, "netbots: NPC %u is character %d here, %d at the host's: made as the host's", slot,
-                          kind[0], s.kind[0]);
-                body = MakeNpc(ctx, slot, s);
-            }
             if (!body && s.health > 0 && (s.entity_flags & 1)) {
-                body = story ? MakeNpc(ctx, slot, s) : Revive(ctx, slot);
-                if (body) LOG_FIRST(40, "netbots: %s %u made (character %d)", story ? "NPC" : "bot", slot, s.kind[0]);
+                body = Revive(ctx, slot);
+                if (body) LOG_FIRST(40, "netbots: bot %u made (character %d)", slot, s.kind[0]);
             }
             if (!body || !Valid(body, 0x2E8) || R32(body + 0x7C) != actor) {
                 List(actor, false);
@@ -567,15 +513,12 @@ void Frame(X86Context& ctx) {
         std::memset(&s, 0, sizeof s);
         s.slot = slot;
         s.tick = tick;
-        if (!story) {
-            std::memcpy(s.scores, At(actor + 0xA10), sizeof s.scores);
-            for (uint32_t killer = 0; killer < humans + bots; killer++)
-                std::memcpy(&s.killed_by[killer], At(pool + killer * kActorSize + 0xA10 + slot * 2), 2);
-        }
-        // no body: said so, or a lost death would leave the others' copy standing (a Story level's many empty
-        // slots once a second)
+        std::memcpy(s.scores, At(actor + 0xA10), sizeof s.scores);
+        for (uint32_t killer = 0; killer < humans + bots; killer++)
+            std::memcpy(&s.killed_by[killer], At(pool + killer * kActorSize + 0xA10 + slot * 2), 2);
+        // no body: said so, or a lost death would leave the others' copy standing
         if (!body || !Valid(body, 0x2E8)) {
-            if (!story || tick % 60 < interval) Send(s);
+            Send(s);
             continue;
         }
         s.body_present = 1;
@@ -583,8 +526,7 @@ void Frame(X86Context& ctx) {
         float health;
         std::memcpy(&health, At(body + 0x1CC), 4);
         // a network match leaves the bots' bodies off: a living one is drawn and hit (0x61)
-        // (a Story NPC is drawn as the level's scripts have it)
-        if (!story && life && life != 2 && !(dead & 4) && health > 0 && (flags & 0x61) != 0x61) {
+        if (life && life != 2 && !(dead & 4) && health > 0 && (flags & 0x61) != 0x61) {
             flags |= 0x61;
             W32(body + 0x28, flags);
             Refresh(ctx, body);
@@ -645,9 +587,9 @@ void AsArcade(X86Context& ctx, uint8_t* base, void (*original)(X86Context&, uint
 }  // namespace
 
 namespace game {
-// the host's match settings, before they are sent or loaded (0x356490, 0x658D0 in coop_online.cpp)
+// the host's match settings, before they are sent or loaded (0x356490, 0x658D0 in frame_clock.cpp)
 void NetBotsConfig(uint32_t config) {
-    if (config == kMenuConfig && !game::StoryOnlinePlayerLimit()) Prepare(true);
+    if (config == kMenuConfig) Prepare(true);
 }
 }  // namespace game
 
@@ -664,19 +606,32 @@ AS_ARCADE(sub_002C1570)
 AS_ARCADE(sub_002C1490)
 #undef AS_ARCADE
 
+// The bot set a map keeps (0x2C0210, which Arcade's 9 reaches): read from the map block's bots chunk (0xC77668), and the
+// game takes the chunk to be there. In a lobby the block holds no map, or one kept from before without it (a new map's
+// block is cleared): there the set is empty, as a map with no bots gives it (the count at 0x75FB58, 0).
+X86_EXTERN_FUNC(__imp__sub_002C0210);
+X86_FUNC(sub_002C0210) {
+    constexpr uint32_t kMapBlock = 0x784014, kBotsChunk = 0xC77668, kSet = 0x75FB58, kSetWords = 0x29, kChunkFind = 0x32A5B0;
+    if (!kernel::CallGuest(ctx, kChunkFind, {R32(kMapBlock), kBotsChunk})) {
+        std::memset(kernel::HostPtr(kSet), 0, kSetWords * 4);
+        ctx.eax = kSet;
+        ctx.esp += 4;
+        return;
+    }
+    __imp__sub_002C0210(ctx, base);
+}
+
 // SendSettings(config): the match settings to the others
 X86_EXTERN_FUNC(__imp__sub_00356490);
 X86_FUNC(sub_00356490) {
     game::NetBotsConfig(R32(ctx.esp + 4));
-    game::StoryOnlinePrepare(ctx, R32(ctx.esp + 4));
     __imp__sub_00356490(ctx, base);
 }
 
 // LobbySend(): the lobby's settings to the others, again while it waits
 X86_EXTERN_FUNC(__imp__sub_00354240);
 X86_FUNC(sub_00354240) {
-    if (LobbyNetwork() && R32(kLobbyState) == kLobbyReady && !game::StoryOnlinePlayerLimit()) Prepare(true);
-    game::StoryOnlineLobbyConfig();
+    if (LobbyNetwork() && R32(kLobbyState) == kLobbyReady) Prepare(true);
     __imp__sub_00354240(ctx, base);
 }
 
@@ -684,10 +639,6 @@ X86_FUNC(sub_00354240) {
 X86_EXTERN_FUNC(__imp__sub_0035E630);
 X86_FUNC(sub_0035E630) {
     __imp__sub_0035E630(ctx, base);
-    if (uint32_t story = game::StoryOnlinePlayerLimit()) {
-        ctx.eax = std::min(ctx.eax, story);
-        return;
-    }
     if (LobbyNetwork() && g_enabled)
         if (uint32_t limit = Limit()) ctx.eax = std::min(ctx.eax, limit);
 }
@@ -708,7 +659,6 @@ X86_FUNC(sub_002D38C0) {
 // LobbyDraw(): its population line says the bots too
 X86_EXTERN_FUNC(__imp__sub_00197890);
 X86_FUNC(sub_00197890) {
-    if (game::StoryOnlineLobbyHeader(ctx)) return;  // a Story lobby's header: the mission
     bool previous = g_lobby_drawing;
     g_lobby_drawing = LobbyNetwork();
     __imp__sub_00197890(ctx, base);
@@ -739,10 +689,6 @@ X86_FUNC(sub_0003D7F0) {
 // Active(slot): a network player there; for the callers that go through every actor, a bot too
 X86_EXTERN_FUNC(__imp__sub_003568C0);
 X86_FUNC(sub_003568C0) {
-    if (game::StoryOnlineActorActive(R32(ctx.esp), R32(ctx.esp + 4), ctx.ebx)) {
-        kernel::Return(ctx, 1, 0);
-        return;
-    }
     switch (R32(ctx.esp)) {
         case 0x064743:  // team score order
         case 0x064856:  // scores
@@ -894,18 +840,6 @@ X86_FUNC(sub_001BB5C0) {
         if (!shot.serial) shot.serial = 1;
         if (ShotValid(shot, Humans() + Bots())) g_shots[slot] = shot;
     }
-}
-
-// SpawnNpc(record, ...): a Story level's NPC coming in at a free slot; on the others none (-1, as when there's no
-// room, which its caller 0x164207 takes): the host's spawns come in its states, in the host's slots
-X86_EXTERN_FUNC(__imp__sub_0015DF20);
-X86_FUNC(sub_0015DF20) {
-    if (Story() && InGame(2) && !g_making) {
-        LOG_FIRST(5, "netbots: this game's own NPC spawn left to the host");
-        kernel::Return(ctx, UINT32_MAX, 0);
-        return;
-    }
-    __imp__sub_0015DF20(ctx, base);
 }
 
 // InReach(eax character's body, edx thing), from the things that go through the characters (0xC15B0): a character

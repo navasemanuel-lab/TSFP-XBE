@@ -8,9 +8,11 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <future>
 #include <thread>
 #include <vector>
 
+#include "app/app.h"
 #include "audio/audio.h"
 #include "core/log.h"
 
@@ -33,24 +35,52 @@ struct Wake : IXAudio2VoiceCallback {
 }  // namespace
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
-    std::thread([render] {
+    std::promise<void> known;
+    std::future<void> ready = known.get_future();
+    std::thread([render, known = std::move(known)]() mutable {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IXAudio2* xa = nullptr;
         IXAudio2MasteringVoice* master = nullptr;
         IXAudio2SourceVoice* voice = nullptr;
         static Wake wake;
-        WAVEFORMATEX wf{};
-        wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-        wf.nChannels = 2;
-        wf.nSamplesPerSec = kRate;
-        wf.wBitsPerSample = 32;
-        wf.nBlockAlign = 8;
-        wf.nAvgBytesPerSec = kRate * 8;
-        if (FAILED(XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)) || FAILED(xa->CreateMasteringVoice(&master)) ||
-            FAILED(xa->CreateSourceVoice(&voice, &wf, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &wake))) {
+        if (FAILED(XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)) || FAILED(xa->CreateMasteringVoice(&master))) {
             LOGE("audio: XAudio2 unavailable, no sound");
+            known.set_value();
             return;
         }
+        // the speakers: as Windows has them (5.1 from six channels up), or the setting's; a 5.1 mix on stereo
+        // speakers is folded down by XAudio2
+        uint32_t out = app::Get().audio_out;
+        XAUDIO2_VOICE_DETAILS details{};
+        master->GetVoiceDetails(&details);
+        DWORD mask = 0;
+        master->GetChannelMask(&mask);
+        bool surround = out == 3 || (out == 0 && details.InputChannels >= 6);
+        uint32_t ch = surround ? 6 : 2;
+        g_channels = ch;
+        g_mono = out == 1;
+        WAVEFORMATEXTENSIBLE wf{};
+        wf.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        wf.Format.nChannels = WORD(ch);
+        wf.Format.nSamplesPerSec = kRate;
+        wf.Format.wBitsPerSample = 32;
+        wf.Format.nBlockAlign = WORD(4 * ch);
+        wf.Format.nAvgBytesPerSec = kRate * 4 * ch;
+        wf.Format.cbSize = sizeof(wf) - sizeof(WAVEFORMATEX);
+        wf.Samples.wValidBitsPerSample = 32;
+        // 5.1 as the speakers have it when they are 5.1 (back or side pair): the same order, taken one to one
+        wf.dwChannelMask = !surround ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT)
+                           : details.InputChannels == 6 ? mask
+                                                         : 0x3F;  // front pair, centre, sub, back pair
+        wf.SubFormat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};  // IEEE float
+        if (FAILED(xa->CreateSourceVoice(&voice, &wf.Format, 0, XAUDIO2_DEFAULT_FREQ_RATIO, &wake))) {
+            LOGE("audio: XAudio2 voice of %u channels refused, no sound", ch);
+            known.set_value();
+            return;
+        }
+        LOGI("audio: %s output (Windows: %u channels, mask %lX)", out == 1 ? "mono" : surround ? "5.1" : "stereo",
+             details.InputChannels, mask);
+        known.set_value();
         voice->Start();
         // 5 ms buffers, 15 ms queued to start with: XAudio2 takes 10 ms a pass, so one pass and half the next are
         // ready; rendered as each buffer ends rather than polled. 10 ms buffers with 30 ms queued, checked every 2 ms,
@@ -60,7 +90,7 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         constexpr uint32_t kMaxQueued = 20;
         // one slot more than can be queued, so the one rendered is never one XAudio2 still reads
         constexpr uint32_t kSlots = kMaxQueued + 1;
-        std::vector<float> bufs(kSlots * kFrames * 2);
+        std::vector<float> bufs(kSlots * kFrames * ch);
         uint32_t depth = kMinQueued;
         for (uint32_t n = 0;;) {
             XAUDIO2_VOICE_STATE st;
@@ -74,15 +104,16 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
                 WaitForSingleObject(wake.event, 20);
                 continue;
             }
-            float* b = &bufs[(n % kSlots) * kFrames * 2];
+            float* b = &bufs[(n % kSlots) * kFrames * ch];
             render(b, kFrames);
             XAUDIO2_BUFFER xb{};
-            xb.AudioBytes = kFrames * 8;
+            xb.AudioBytes = kFrames * 4 * ch;
             xb.pAudioData = reinterpret_cast<const BYTE*>(b);
             voice->SubmitSourceBuffer(&xb);
             n++;  // only a submitted buffer takes a slot, XAudio2 still reads the queued ones
         }
     }).detach();
+    ready.wait();
 }
 
 }  // namespace audio

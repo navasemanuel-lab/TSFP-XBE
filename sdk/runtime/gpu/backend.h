@@ -58,6 +58,9 @@ private:
 };
 
 std::unique_ptr<Backend> CreateBackend();
+// --prepare-shaders: the pipelines of the shipped seeds and earlier runs made into pipelines.bin, no window or game;
+// the process's exit code
+int PrepareShaders();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 

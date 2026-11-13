@@ -23,7 +23,7 @@ constexpr uint32_t kCharacters = 0x7A3580, kCharacterCount = 0x74C37C;
 constexpr uint32_t kTagBuffers = 0x7451A0, kFadeBuffers = 0x746EBC, kTagSlots = 32;
 constexpr uint32_t kViewPlayer = 0x7B0C7C;  // the player whose view is drawn: +4 the view
 constexpr uint32_t kProfiles = 0x7BEDC4, kProfileSize = 0x1F54, kProfileName = 0x7C;
-constexpr uint32_t kSessionUp = 0x76B108;  // System Link (Online Story): the game's own name, the network's
+constexpr uint32_t kSessionUp = 0x76B108;  // System Link: the game's own name, the network's
 
 bool g_tags = false;  // in the tags' drawing for Story co-op
 

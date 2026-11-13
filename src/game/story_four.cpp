@@ -48,9 +48,6 @@ struct Saved {
 }  // namespace
 
 namespace game {
-bool StoryOnlineOpening();                                    // game/story_online.cpp
-bool StoryOnlineSpawnPad(X86Context& ctx, uint32_t context);  // game/story_online.cpp
-
 // the main menu's builder (game/menu_layout.cpp) round this: its Story row offered to three and four players as to two
 void StoryMenuForFour(bool building) {
     static uint32_t local = 0;
@@ -76,7 +73,6 @@ X86_EXTERN_FUNC(__imp__sub_000CF060);
 X86_FUNC(sub_000CF060) {
     uint32_t player = kernel::R32(ctx.esp + 4);
     __imp__sub_000CF060(ctx, base);
-    if (game::StoryOnlineSpawnPad(ctx, player)) return;  // online Story's opening: its own starts
     if (ctx.eax != 0xFFFFFFFFu || !Story() || Count() <= 2 || Count() > 4 || !Valid(player, kPlayerSize)) return;
     uint32_t index = kernel::R32(player);
     if (index < 2 || index >= Count() || player != Player(index)) return;
@@ -93,7 +89,7 @@ X86_EXTERN_FUNC(__imp__sub_000D4F50);
 X86_FUNC(sub_000D4F50) {
     uint32_t player = kernel::R32(ctx.esp + 4);
     __imp__sub_000D4F50(ctx, base);
-    if (!Story() || game::StoryOnlineOpening() || Count() <= 2 || Count() > 4 || !Valid(player, kPlayerSize)) return;
+    if (!Story() || Count() <= 2 || Count() > 4 || !Valid(player, kPlayerSize)) return;
     uint32_t index = kernel::R32(player);
     uint32_t partner = Player(1);
     if (index < 2 || index >= Count() || !ActorOf(partner) || !ActorOf(player)) return;

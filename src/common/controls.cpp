@@ -92,8 +92,8 @@ struct NamedKey {
     const char* label;  // on the button prompts
 };
 constexpr NamedKey kNames[] = {
-    {"Mouse1", VK_LBUTTON, "LMB"}, {"Mouse2", VK_RBUTTON, "RMB"}, {"Mouse3", VK_MBUTTON, "MMB"},
-    {"Mouse4", VK_XBUTTON1, "M4"}, {"Mouse5", VK_XBUTTON2, "M5"}, {"Enter", VK_RETURN, "ENTER"},
+    {"Mouse1", VK_LBUTTON, "Mouse 1"}, {"Mouse2", VK_RBUTTON, "Mouse 2"}, {"Mouse3", VK_MBUTTON, "Mouse 3"},
+    {"Mouse4", VK_XBUTTON1, "Mouse 4"}, {"Mouse5", VK_XBUTTON2, "Mouse 5"}, {"Enter", VK_RETURN, "ENTER"},
     {"Space", VK_SPACE, "SPACE"},  {"Backspace", VK_BACK, "BKSP"}, {"Escape", VK_ESCAPE, "ESC"},
     {"Tab", VK_TAB, "TAB"},        {"Ctrl", VK_CONTROL, "CTRL"},   {"Shift", VK_SHIFT, "SHIFT"},
     {"CapsLock", VK_CAPITAL, "CAPS"}, {"Up", VK_UP, "UP"},         {"Down", VK_DOWN, "DOWN"},
@@ -150,6 +150,8 @@ bool MouseButton(int vk) {
 
 std::atomic<bool> g_keyboard{true};  // the keyboard and mouse were used last, not a controller
 std::atomic<input::Family> g_family{input::Family::None};  // the controller used last
+std::atomic<bool> g_port_keyboard[4];                       // the port's player used the keyboard and mouse last
+std::atomic<input::Family> g_port_family[4];                // the controller each port used last
 
 // a controller's buttons as its own markings; one SDL cannot name keeps the game's Xbox icons
 icons::Style PromptStyle(input::Family f) {
@@ -423,7 +425,7 @@ void Script(input::Pad& p) {
 }
 
 // Gyro aiming: player 1's controller's turn as the mouse's counts, so it turns the view wherever the mouse does (on
-// foot, a mounted gun, a vehicle, zoomed in less) and in online co-op goes with the mouse's turn. Only in play: in a
+// foot, a mounted gun, a vehicle, zoomed in less). Only in play: in a
 // menu the counts would move its pointer.
 constexpr uint32_t kGamePlayers = 0x5236C4;  // the local players chosen
 void GyroAim() {
@@ -490,6 +492,8 @@ void Pad(int port, input::Pad& pad) {
     if (Used(pad)) {
         g_keyboard = false;
         g_family = input::PadFamily(port);
+        g_port_keyboard[port] = false;
+        g_port_family[port] = g_family.load();
     }
     // port 1 is always there for the keyboard
     // Back and Start together open or close the settings panel; the game sees idle pads while it is open
@@ -510,21 +514,12 @@ void Pad(int port, input::Pad& pad) {
             app::Save();
         }
         MergeSoloPad(pad);
-        if (Keyboard(pad)) g_keyboard = true;
+        if (Keyboard(pad)) { g_keyboard = true; g_port_keyboard[0] = true; }
         GyroAim();
         Script(pad);
         mouse::KeepLocked();
         debug::Tick();
-        // XBE_PROMPTS=xbox|ps4|ps5|switch: those prompts whatever is used, for testing without the controller
-        static const icons::Style forced = [] {
-            const char* e = std::getenv("XBE_PROMPTS");
-            std::string s = e ? e : "";
-            return s == "xbox" ? icons::Style::Xbox : s == "ps4" ? icons::Style::PlayStation4
-                 : s == "ps5" ? icons::Style::PlayStation5 : s == "switch" ? icons::Style::Switch
-                 : icons::Style::Original;
-        }();
-        if (forced != icons::Style::Original) icons::Update(forced);
-        else icons::Update(g_keyboard ? icons::Style::Keyboard : PromptStyle(g_family));
+        icons::Update(PromptStyleFor(-1));
     }
     if (panel::Holds(port, pad)) {
         pad = input::Pad{.connected = pad.connected};
@@ -598,20 +593,84 @@ void SetKeys(const std::string& id, const std::string& keys) {
 
 bool KeyboardActive() { return g_keyboard; }
 
+icons::Style PromptStyleFor(int slot) {
+    // XBE_PROMPTS=xbox|ps4|ps5|switch: those prompts whatever is used, for testing without the controller
+    static const icons::Style forced = [] {
+        const char* e = std::getenv("XBE_PROMPTS");
+        std::string s = e ? e : "";
+        return s == "xbox" ? icons::Style::Xbox : s == "ps4" ? icons::Style::PlayStation4
+             : s == "ps5" ? icons::Style::PlayStation5 : s == "switch" ? icons::Style::Switch
+             : icons::Style::Original;
+    }();
+    if (forced != icons::Style::Original) return forced;
+    if (slot < 0 || slot > 3) return g_keyboard ? icons::Style::Keyboard : PromptStyle(g_family);
+    // the keyboard on a port of its own is player 1's, a pad never is; on a shared port the device used last
+    if (slot == 0 && (game::Opt().keyboard_own_port || g_port_keyboard[0])) return icons::Style::Keyboard;
+    input::Family f = input::PadFamily(slot);
+    if (f == input::Family::None) f = g_port_family[slot];
+    if (f == input::Family::None) return slot == 0 ? icons::Style::Keyboard : icons::Style::Original;
+    return PromptStyle(f);
+}
+
 int TakeWeapon() {
     int weapon = g_weapon.exchange(0);
     return weapon && NowMs() - g_weapon_at <= 150 ? weapon : 0;
 }
 
+// a control's key for a prompt: one on the keyboard if it has any, else a mouse button
+template <class Match>
+const Key* PromptKey(Match match) {
+    const Key* mouse = nullptr;
+    for (const Key& k : g_keys) {
+        if (!match(k)) continue;
+        if (!MouseButton(k.vk)) return &k;
+        if (!mouse) mouse = &k;
+    }
+    return mouse;
+}
+
 const char* KeyLabel(Button b) {
     static const int kAnalog[] = {kA, kB, kX, kY, kBlack, kWhite};
-    for (const Key& k : g_keys) {
-        bool match = b == Button::Start  ? (k.bits & kStart) != 0
-                     : b == Button::Back ? (k.bits & kBack) != 0
-                                         : k.analog == kAnalog[int(b)];
-        if (match) return k.label.c_str();
+    const Key* k = PromptKey([&](const Key& k) {
+        return b == Button::Start  ? (k.bits & kStart) != 0
+               : b == Button::Back ? (k.bits & kBack) != 0
+                                   : k.analog == kAnalog[int(b)];
+    });
+    return k ? k->label.c_str() : "";
+}
+
+// the keys a prompt code stands for, by their labels; empty for a code that is not one
+std::vector<std::string> PromptLabels(char code) {
+    switch (code) {
+        case 'D': return {"W", "A", "S", "D"};
+        case 'P': return {"A", "D"};
+        case 'Q': return {"W", "S"};
+        case 'E': return {"MOUSE_XY"};
+        case 'R': return {"MOUSE_X"};
+        case 'S': return {"MOUSE_Y"};
+        default: break;
     }
-    return "";
+    std::vector<int> actions;
+    switch (code) {
+        case 'A': actions = {12, 13}; break;
+        case 'B': actions = {10, 11}; break;
+        case '9': case 'T': actions = {10, 11, 12, 13}; break;
+        case 'G': case 'J': case 'K': actions = {8}; break;
+        case 'I': actions = {9}; break;
+        case 'L': actions = {14}; break;
+        case 'M': actions = {15}; break;
+        case 'N': actions = {10}; break;
+        case 'O': actions = {11}; break;
+        default: return {};
+    }
+    std::vector<std::string> labels;
+    for (int i : actions) {
+        const Action& a = kActions[i];
+        const Key* k = PromptKey([&](const Key& k) { return k.analog == a.analog && k.bits == a.bits; });
+        if (!k) return {};
+        labels.push_back(k->label);
+    }
+    return labels;
 }
 
 std::string PromptKeys(char code) {
@@ -637,10 +696,9 @@ std::string PromptKeys(char code) {
     std::string text = "[";
     for (int i : actions) {
         const Action& a = kActions[i];
-        auto k = std::find_if(g_keys.begin(), g_keys.end(),
-                              [&](const Key& k) { return k.analog == a.analog && k.bits == a.bits; });
+        const Key* k = PromptKey([&](const Key& k) { return k.analog == a.analog && k.bits == a.bits; });
         if (text.size() > 1) text += '/';
-        text += k != g_keys.end() ? k->label : "-";
+        text += k ? k->label : "-";
     }
     return text + "]";
 }

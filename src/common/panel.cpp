@@ -6,9 +6,7 @@
 // line says. The settings file is written on closing, and a rebound control at once. It is drawn with ImGui over the
 // frame, after the frame is scaled to the window. While it is open the cursor is free and the game sees idle pads, but
 // the game keeps running. After it closes, the keys and buttons that closed it reach the game only once they are let
-// go. The Co-op tab chooses Story's players' characters and shows an online co-op session (net/lockstep.h), and while
-// one runs the settings that change how the game plays out are the host's, shown fixed; the session's notices (the
-// other player late or gone) are drawn over the game.
+// go.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -41,7 +39,6 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
-#include "net/lockstep.h"
 #include "xdk/d3d8.h"
 
 namespace game {
@@ -50,7 +47,6 @@ void ApplyScreenShape();  // game/fov.cpp
 void ApplyFont();         // game/ts2_style.cpp
 std::vector<std::pair<uint32_t, uint32_t>> DisplayModes();  // game/video_menu.cpp: the desktop's, then the sizes
 std::string DisplayModeName(uint32_t w, uint32_t h);
-std::string CoopNotice();  // game/coop_online.cpp
 std::vector<std::string> StoryCharacterNames();  // game/story_characters.cpp
 }  // namespace game
 
@@ -60,7 +56,7 @@ namespace {
 
 constexpr int kToggleKey = VK_F1;
 constexpr float kFontPx = 48;   // the frame rate's and notices' letters made at this size
-constexpr float kTextPx = 14;   // the panel's text at a 1080 line screen, more on a taller one
+constexpr float kTextPx = 18;   // the panel's text at a 1080 line screen, more on a taller one
 constexpr float kTitle = 1.7f, kHeadingSize = 1.25f;  // the headings' sizes, of the text's
 constexpr int kSlots = 3;       // keys shown for each action
 
@@ -382,25 +378,108 @@ void DisplayTab() {
         s.display_mode = app::DisplayMode(mode);
         app::ApplyDisplay();
     }
-    auto at = std::find(g_modes.begin(), g_modes.end(), std::make_pair(s.width, s.height));
-    if (at == g_modes.end()) {
-        g_modes.push_back({s.width, s.height});
-        g_mode_names.push_back(game::DisplayModeName(s.width, s.height));
-        at = g_modes.end() - 1;
+    // the monitors by their Windows number; picking another takes its desktop size, its modes listed anew
+    std::vector<app::MonitorInfo> monitors = app::Monitors();
+    if (monitors.size() > 1) {
+        std::vector<std::string> names;
+        int pick = -1;
+        for (size_t i = 0; i < monitors.size(); i++) {
+            const app::MonitorInfo& m = monitors[i];
+            names.push_back("Display " + std::to_string(m.number) + "  (" + std::to_string(m.width) + "x" +
+                            std::to_string(m.height) + (m.primary ? ", main)" : ")"));
+            if (s.monitor.empty() ? m.primary : s.monitor == m.device) pick = int(i);
+        }
+        if (pick < 0) {
+            names.push_back("Unplugged: the main one now");
+            pick = int(names.size() - 1);
+        }
+        if (Choice("Monitor", pick, names,
+                   "The monitor the game shows on in fullscreen and borderless, and where the window opens.") &&
+            pick < int(monitors.size())) {
+            s.monitor = monitors[pick].primary ? "" : monitors[pick].device;
+            s.width = s.height = 0;
+            app::ApplyDisplay();
+            game::ApplyScreenShape();
+            g_modes = game::DisplayModes();
+            g_mode_names.clear();
+            for (auto [w, h] : g_modes) g_mode_names.push_back(game::DisplayModeName(w, h));
+        }
     }
-    int res = int(at - g_modes.begin());
-    if (Choice("Resolution", res, g_mode_names,
-               "The window's size, or the screen's mode in fullscreen. Desktop is the monitor's own.")) {
-        s.width = g_modes[res].first;
-        s.height = g_modes[res].second;
-        app::ApplyDisplay();
-        game::ApplyScreenShape();
+    // the screen's size: the desktop's unless lowered in fullscreen; the window's when windowed; borderless is always
+    // the monitor's own
+    if (s.display_mode != app::DisplayMode::Borderless) {
+        auto at = std::find(g_modes.begin(), g_modes.end(), std::make_pair(s.width, s.height));
+        if (at == g_modes.end()) {
+            g_modes.push_back({s.width, s.height});
+            g_mode_names.push_back(game::DisplayModeName(s.width, s.height));
+            at = g_modes.end() - 1;
+        }
+        std::vector<std::string> names = g_mode_names;
+        app::Mode desk = app::Desktop();
+        for (size_t i = 0; i < g_modes.size(); i++)
+            if (!g_modes[i].first)
+                names[i] = "Desktop (" + std::to_string(desk.width) + "x" + std::to_string(desk.height) + ", auto)";
+        int res = int(at - g_modes.begin());
+        bool windowed = s.display_mode == app::DisplayMode::Windowed;
+        if (Choice(windowed ? "Window size" : "Screen resolution", res, names,
+                   windowed ? "The window's size. Desktop opens it at three quarters of the screen's height."
+                            : "The monitor's mode in fullscreen. Desktop, found by itself, is the monitor's own; a lower "
+                              "one changes the screen's mode. To draw the game sharper or faster, use Resolution "
+                              "below instead.")) {
+            s.width = g_modes[res].first;
+            s.height = g_modes[res].second;
+            app::ApplyDisplay();
+            game::ApplyScreenShape();
+        }
     }
-    Slider("Render scale", s.render_percent, 1, 200, 100, "%d%%",
-           "The scene drawn at this part of the output's height. Under 100% is faster; over it the scene is drawn "
-           "larger and shrunk to the screen, smoother edges for more GPU work (200% on a 1080p screen draws at 4K). "
-           "Applies when the slider is let go; a right click puts back 100%.",
-           false);
+    // the render resolution as lines drawn, lowest to highest: the console's 480, the screen's own (Native), then
+    // 720p to 2160p (4K); over the screen's it is drawn larger and shrunk to it (supersampling). Kept as render_percent.
+    {
+        float out_h = float(std::max(app::Output().height, 1u));
+        float now = out_h * float(s.render_percent) / 100.0f;
+        struct Step {
+            float lines;
+            const char* name;
+        };
+        // 4K at the most: the native step stays even on a screen taller than that
+        std::vector<Step> steps = {{480, "Original"}, {out_h, "Native"}, {720, "720p"},
+                                   {1080, "1080p"},   {1440, "1440p"},   {2160, "2160p (4K)"}};
+        std::stable_sort(steps.begin(), steps.end(), [](const Step& a, const Step& b) { return a.lines < b.lines; });
+        // one line each: a step the screen's own matches is Native
+        std::vector<Step> list;
+        for (const Step& st : steps) {
+            auto same = std::find_if(list.begin(), list.end(),
+                                     [&](const Step& o) { return std::fabs(o.lines - st.lines) < 1.5f; });
+            if (same == list.end()) list.push_back(st);
+            else if (st.name[0] == 'N') same->name = st.name;
+        }
+        std::vector<std::string> names;
+        int pick = -1;
+        for (size_t i = 0; i < list.size(); i++) {
+            char name[64];
+            bool word = list[i].name[0] == 'N' || list[i].name[0] == 'O';
+            if (word) std::snprintf(name, sizeof(name), "%s (%.0fp)", list[i].name, list[i].lines);
+            else std::snprintf(name, sizeof(name), "%s%s", list[i].name, list[i].lines > out_h + 1 ? "  supersampled" : "");
+            names.push_back(name);
+            if (std::fabs(list[i].lines - now) < 1.5f) pick = int(i);
+        }
+        if (pick < 0) {  // a scale of the settings file or a preset between the steps
+            char name[64];
+            std::snprintf(name, sizeof(name), "%.0fp (%u%%)", now, s.render_percent);
+            auto at = std::upper_bound(list.begin(), list.end(), now, [](float v, const Step& o) { return v < o.lines; });
+            pick = int(at - list.begin());
+            list.insert(at, {now, ""});
+            names.insert(names.begin() + pick, name);
+        }
+        if (Choice("Resolution", pick, names,
+                   "The size the game is drawn at; the screen keeps its own. Native matches the screen's pixels, "
+                   "Original draws the console's 480 lines. Higher than the screen is drawn larger and shrunk to it "
+                   "(supersampling): sharper and smoother, for more GPU work.") &&
+            list[pick].name[0]) {
+            s.render_percent = std::clamp<uint32_t>(uint32_t(list[pick].lines / out_h * 100.0f + 0.5f), 1, 450);
+            s.render_fitted = true;  // the player's choice: the GPU check leaves it
+        }
+    }
     int aspect = int(s.aspect);
     if (Choice("Aspect ratio", aspect, {"Auto", "4:3", "16:9", "16:10", "21:9", "32:9"},
                "The picture's shape. Auto follows the window; 4:3 is the console's.")) {
@@ -484,23 +563,6 @@ void Presets() {
 void GraphicsTab() {
     app::Settings& s = app::Get();
     game::Options& o = game::Opt();
-    // System Link and online play: everyone at the game's own angles, the lines gone. Online co-op: each machine's own.
-    if (!game::FovLocked()) {
-        bool coop = lockstep::Active();
-        if (Slider("Field of view", game::Fov(0), 40, 100, 55, "%d\xC2\xB0",
-                   coop ? "How much of the world your view takes in. Yours alone: the other player keeps theirs. A right "
-                          "click puts back 55."
-                        : "How much of the world the view takes in, top to bottom. Wider shows more at the edges. A "
-                          "right click puts back 55."))
-            game::ApplyWeaponFov();
-        if (Slider("Weapon field of view", game::WeaponFov(0), 30, 70, 45, "%d\xC2\xB0",
-                   coop ? "Your held weapon's angle. Yours alone: the other player keeps theirs. A right click puts "
-                          "back 45."
-                        : "The held weapon's angle, whatever the view's. Lower draws it bigger. A right click puts back "
-                          "45."))
-            game::ApplyWeaponFov();
-    }
-    Switch("Hands", o.hands, "The arms holding the weapon. Off, the weapon alone, as in TimeSplitters 2.");
     const char* limited = s.low_profile ? "(4x at most on this GPU)" : nullptr;
     Values("Texture sharpness", s.aniso, {0, 2, 4, 8, 16}, Filtering,
            "Anisotropic filtering: textures stay sharp at a slant.", limited);
@@ -527,16 +589,10 @@ void GraphicsTab() {
            "Surfaces laid almost on one another (decals, trims, floors over floors) tie in depth as on the console, "
            "the one drawn last showing, instead of flickering near and far as the view moves. Works without MSAA.");
     Switch("Fog", s.fog, "The distance fog of levels such as the mansion. Off, the far scenery is drawn clear.");
-    if (lockstep::Active())
-        Fixed("Rain", o.rain ? "On  (the host's)" : "Off  (the host's)", "Online co-op plays on the host's settings.");
-    else
-        Switch("Rain", o.rain,
-               "The rain around the view and the drops running down the screen, as in the mansion. Off saves its "
-               "thousands of drops a frame; the sound stays.");
-    if (lockstep::Active())
-        Fixed("Blood", o.blood ? "On  (the host's)" : "Off  (the host's)", "Online co-op plays on the host's settings.");
-    else
-        Switch("Blood", o.blood, "The blood sprayed by a hit and the splats and pools it leaves on walls and floors.");
+    Switch("Rain", o.rain,
+           "The rain around the view and the drops running down the screen, as in the mansion. Off saves its "
+           "thousands of drops a frame; the sound stays.");
+    Switch("Blood", o.blood, "The blood sprayed by a hit and the splats and pools it leaves on walls and floors.");
 }
 
 void MouseLines() {
@@ -640,6 +696,10 @@ void PadLines() {
 
 void ControlsTab() {
     if (BeginLines("##mouse")) {
+        Switch("Keyboard on its own player", game::Opt().keyboard_own_port,
+               "The keyboard and mouse are player 1 and controllers are players 2 to 4. Off, the first controller shares "
+               "player 1.",
+               "(next start)");
         MouseLines();
         PadLines();
         EndLines();
@@ -721,23 +781,26 @@ void StoryCharacterLines() {
     }
 }
 
+// what playing is like: the view, what is skipped, the language
 void GameplayTab() {
     game::Options& o = game::Opt();
-    if (lockstep::Active()) {
-        // the session's: they change how the game plays out, both machines play on the host's
-        const char* help = "Online co-op plays on the host's settings.";
-        auto host = [&](const char* label, bool on) { Fixed(label, on ? "On  (the host's)" : "Off  (the host's)", help); };
-        host("Skip intro videos", o.skip_intros);
-        host("Skip any cutscene", o.skip_any_cutscene);
-        host("Fast loading", o.fast_loading);
-        host("Player names in co-op", o.player_names);
-    } else {
-        Switch("Skip intro videos", o.skip_intros, "The EA and Free Radical logo movies at boot.", "(next start)");
-        Switch("Skip any cutscene", o.skip_any_cutscene, "Start or A skips cutscenes the game would not let go of yet.");
-        Switch("Fast loading", o.fast_loading, "A loading screen ends when the load does, not when its bar has filled.");
-        Switch("Player names in co-op", o.player_names, "Each Story co-op player's name over their head.");
+    // System Link and online play: everyone at the game's own angles, the lines gone.
+    if (!game::FovLocked()) {
+        if (Slider("Field of view", game::Fov(0), 40, 100, 55, "%d\xC2\xB0",
+                   "How much of the world the view takes in, top to bottom. Wider shows more at the edges. A right "
+                   "click puts back 55."))
+            game::ApplyWeaponFov();
+        if (Slider("Weapon field of view", game::WeaponFov(0), 30, 70, 45, "%d\xC2\xB0",
+                   "The held weapon's angle, whatever the view's. Lower draws it bigger. A right click puts back 45."))
+            game::ApplyWeaponFov();
     }
-    StoryCharacterLines();
+    Switch("Hands", o.hands, "The arms holding the weapon. Off, the weapon alone, as in TimeSplitters 2.");
+    Switch("Black bars", o.letterbox,
+           "The black bars at the top and bottom when a scene begins or the Mag-charger's x-ray is on. Off, the view stays full.");
+    Switch("Skip intro videos", o.skip_intros, "The EA and Free Radical logo movies at boot.", "(next start)");
+    Switch("Skip any cutscene", o.skip_any_cutscene, "Start or A skips cutscenes the game would not let go of yet.");
+    Switch("Fast loading", o.fast_loading, "A loading screen ends when the load does, not when its bar has filled.");
+    Switch("Player names in co-op", o.player_names, "Each Story co-op player's name over their head.");
     // the disc has these five: menus and voices (sounds_e, _f, _g, _s, _i)
     static const uint32_t kLanguages[] = {1, 4, 3, 5, 6};
     uint32_t& language = app::Get().language;
@@ -745,11 +808,27 @@ void GameplayTab() {
     if (Choice("Language", lang, {"English", "Francais", "Deutsch", "Espanol", "Italiano"},
                "The menus, text and voices, as the console's language setting chose them.", "(next start)"))
         language = kLanguages[lang];
-    Switch("Keyboard on its own player", o.keyboard_own_port,
-           "The keyboard and mouse are player 1 and controllers are players 2 to 4. Off, the first controller shares "
-           "player 1.",
-           "(next start)");
     Switch("Discord status", o.discord, "What you play shown on your Discord profile.", "(next start)");
+}
+
+void AudioTab() {
+    int speakers = int(app::Get().audio_out);
+    if (Choice("Audio output", speakers, {"Automatic", "Mono", "Stereo", "5.1 Surround"},
+               "Automatic follows your speakers as Windows has them. 5.1 puts the sounds behind you on the rear "
+               "speakers and the centre and sub channels on their own.",
+               "(next start)"))
+        app::Get().audio_out = uint32_t(speakers);
+    Switch("Pause in the background", app::Get().pause_unfocused,
+           "The game and its sound stop while another window is in front or the game is minimized. Never in online "
+           "co-op.");
+}
+
+// cheats: who Story's players are; the game's own cheats are in its Extras menu
+void CheatsTab() {
+    StoryCharacterLines();
+    Fixed("The game's cheats", "Extras > Cheats",
+          "Big heads, paintball, Infinite Ammo, Invincible and the rest are switched in the game's own menu, "
+          "Extras > Cheats, once unlocked; Unlock Everything is under View Gallery in the Player menu.");
 }
 
 // the look and the early game's content, read from the player's own copies of the other games
@@ -787,34 +866,6 @@ void EarlyTab() {
 
 // Story's players' characters, alone or in co-op
 
-// Co-op: Story's players' characters; an online session (the main menu's Story > Host or Join Online Story, or
-// --host and --join) started, shown and left here
-void CoopTab() {
-    game::Options& o = game::Opt();
-    if (lockstep::Active()) {
-        Fixed("Session", lockstep::Status(), "Each of you plays your own player full screen; the game is the same on both.");
-        if (Button("Leave co-op", "Starts the game again on its own, with your own saves."))
-            lockstep::Restart("", "");
-        return;
-    }
-    Edit("Host's address", o.net_address,
-         "The address of the player who hosts (a VPN's like Radmin's, or their public one with the port forwarded), "
-         "for Join. The host leaves it as it is.");
-    Edit("Password", o.net_password, "Optional: the host's, the same on both.", true);
-    Fixed("Port", std::to_string(o.net_port), "UDP. net_port in the settings file to change it.");
-    if (Button("Host online co-op", "Starts the game again waiting for player 2; you are player 1 and your saves are "
-                                    "the session's. Also in the main menu: Story > Host Online Story.")) {
-        app::Save();
-        lockstep::Restart("host:" + std::to_string(o.net_port), o.net_password);
-    }
-    if (!o.net_address.empty() &&
-        Button("Join online co-op", "Starts the game again joining the host's address as player 2, with the host's "
-                                    "saves. Also in the main menu: Story > Join Online Story.")) {
-        app::Save();
-        lockstep::Restart("join:" + o.net_address + ":" + std::to_string(o.net_port), o.net_password);
-    }
-}
-
 // Mods: the early content, then the folders in mods beside the game, each switched on or off
 void ModsTab() {
     EarlyTab();
@@ -832,24 +883,9 @@ void ModsTab() {
         std::string help = (m.description.empty() ? std::string("No description.") : m.description) + "\n\nFolder: mods\\" +
                            m.folder + ", " + std::to_string(m.files) + " files" +
                            (m.author.empty() ? std::string() : ", by " + m.author) +
-                           ".\nA change is seen from the next level on. In online co-op both players need the same mods.";
+                           ".\nA change is seen from the next level on. In System Link every player needs the same mods.";
         if (Switch(m.name.c_str(), m.on, help.c_str())) game::mods::SetOn(m.folder, m.on);
     }
-}
-
-// a session's notice over the game: the other player late or gone
-void DrawNotice() {
-    std::string text = lockstep::Notice();
-    if (text.empty()) text = game::CoopNotice();
-    if (text.empty()) return;
-    ImGuiIO& io = ImGui::GetIO();
-    float size = std::clamp(io.DisplaySize.y / 900.0f, 0.75f, 2.5f) * 30;
-    ImVec2 ext = g_font->CalcTextSizeA(size, FLT_MAX, 0, text.c_str());
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-    ImVec2 p{(io.DisplaySize.x - ext.x) / 2, io.DisplaySize.y * 0.12f};
-    dl->AddRectFilled({p.x - size, p.y - size * 0.4f}, {p.x + ext.x + size, p.y + ext.y + size * 0.4f},
-                      kPanelBg, size * 0.2f);
-    dl->AddText(g_font, size, p, kAccent, text.c_str());
 }
 
 // the frame rate in the top left corner, over everything
@@ -964,10 +1000,11 @@ struct Tab {
 constexpr Tab kTabs[] = {
     {"Display", "DISPLAY", DisplayTab, true},
     {"Graphics", "GRAPHICS", GraphicsTab, true, Presets},
-    {"Controls", "CONTROLS", ControlsTab, false},
     {"Gameplay", "GAMEPLAY", GameplayTab, true},
+    {"Controls", "CONTROLS", ControlsTab, false},
+    {"Audio", "AUDIO", AudioTab, true},
+    {"Cheats", "CHEATS", CheatsTab, true},
     {"Mods", "MODS", ModsTab, true},
-    {"Co-op", "CO-OP AND ONLINE", CoopTab, true},
 };
 constexpr int kTabCount = int(std::size(kTabs));
 
@@ -988,10 +1025,10 @@ void Draw() {
         if (ImGui::IsKeyDown(ImGuiKey_ModCtrl) && ImGui::IsKeyPressed(ImGuiKey_Tab, false))
             g_force_tab = (g_tab + (ImGui::IsKeyDown(ImGuiKey_ModShift) ? kTabCount - 1 : 1)) % kTabCount;
     }
-    // a column down the right side, the game seen beside it, as God of War PSP's launcher has its options: 440 px
+    // a column down the right side, the game seen beside it, as God of War PSP's launcher has its options: 560 px
     // wide, 10 point text (13 px), 12 point headings
     float margin = Px(10);
-    ImVec2 size{std::min(Px(440), io.DisplaySize.x - 2 * margin), io.DisplaySize.y - 2 * margin};
+    ImVec2 size{std::min(Px(560), io.DisplaySize.x - 2 * margin), io.DisplaySize.y - 2 * margin};
     ImGui::SetNextWindowPos({io.DisplaySize.x - margin, margin}, ImGuiCond_Appearing, {1, 0});
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
     ImGui::SetNextWindowSizeConstraints({Px(360), Px(300)}, io.DisplaySize);
@@ -1112,7 +1149,6 @@ void Ui(double fps) {
     diag::StatsFlag().store(game::Opt().show_stats, std::memory_order_relaxed);
     diag::StatsLogFlag().store(game::Opt().log_stats, std::memory_order_relaxed);
     if (game::Opt().show_stats) DrawStats(game::Opt().show_fps);
-    DrawNotice();
     bool open = g_open;
     if (open && !g_was_open) Stage();
     g_was_open = open;
@@ -1148,11 +1184,6 @@ bool Message(unsigned msg, uintptr_t wp, intptr_t lp, intptr_t* result) {
 }
 
 void Toggle() { SetOpen(!g_open); }
-void ShowCoop() {
-    for (int i = 0; i < kTabCount; i++)
-        if (std::strcmp(kTabs[i].name, "Co-op") == 0) g_force_tab = i;
-    SetOpen(true);
-}
 bool Open() { return g_open; }
 
 bool Holds(int port, const input::Pad& pad) {

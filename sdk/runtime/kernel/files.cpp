@@ -10,7 +10,6 @@
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
-#include "net/lockstep.h"
 
 namespace fs = std::filesystem;
 
@@ -99,7 +98,6 @@ struct Link : Object {
 
 uint64_t ToFileTime(fs::file_time_type t) {
     using namespace std::chrono;
-    if (lockstep::Active()) return 127490112000000000ull;  // a co-op session: every file dated 1 January 2005
     auto sys = time_point_cast<nanoseconds>(t - fs::file_time_type::clock::now() + system_clock::now());
     return uint64_t(sys.time_since_epoch().count() / 100 + 116444736000000000ll);
 }

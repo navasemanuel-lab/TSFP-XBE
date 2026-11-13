@@ -21,7 +21,6 @@
 #include "common/mouse.h"
 #include "common/options.h"
 #include "core/log.h"
-#include "net/lockstep.h"
 
 namespace mouse {
 
@@ -301,10 +300,7 @@ void InGameCursor() {
     g_game_cursor_ms = NowMs();
 }
 
-// In an online co-op session (net/lockstep.h) the game sees only what goes over the network: the pointer in the menus,
-// MapMaker's cursor and typed characters, which would act on this machine's game alone, are off (the keys and the pad
-// work the menus and the on-screen keyboards)
-bool GameCursorMode() { return NowMs() - g_game_cursor_ms < kRecentMs && !Play() && !lockstep::Active(); }
+bool GameCursorMode() { return NowMs() - g_game_cursor_ms < kRecentMs && !Play(); }
 bool InPlay() { return Play(); }
 
 Pointer MenuPointer(bool take) {
@@ -313,7 +309,7 @@ Pointer MenuPointer(bool take) {
         std::lock_guard lock(g_test_lock);
         if (NowMs() - g_test_ms < kTestMs) return g_test;
     }
-    if (g_unlocked || lockstep::Active()) return p;  // the settings panel's; a co-op session's game takes no pointer
+    if (g_unlocked) return p;  // the settings panel's
     if (take) p.wheel = g_wheel.exchange(0);
     POINT pt;
     RECT r;
@@ -333,7 +329,7 @@ Pointer MenuPointer(bool take) {
 }
 
 void SetTextEntry(bool on) {
-    if (!on || lockstep::Active()) return;
+    if (!on) return;
     if (NowMs() - g_text_ms >= kRecentMs) {
         std::lock_guard lock(g_chars_lock);
         g_chars.clear();
@@ -344,7 +340,6 @@ void SetTextEntry(bool on) {
 bool TextEntry() { return NowMs() - g_text_ms < kRecentMs; }
 
 int TakeChar() {
-    if (lockstep::Active()) return 0;
     std::lock_guard lock(g_chars_lock);
     if (g_chars.empty()) return 0;
     int c = static_cast<unsigned char>(g_chars.front());

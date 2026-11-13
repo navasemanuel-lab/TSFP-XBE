@@ -5,7 +5,7 @@
 // one. Drawn with Direct2D: the banner is the game's cover when the art folder beside the launcher has it
 // (art/cover.jpg, and art/logo.png for a cover wider than tall: the release's, not part of this source), then the
 // pictures of art/slides in their names' order, one fading into the next; else a time portal made here.
-//   --snapshot <file.png> [missing|ready|importing|settings|mods|saves|levels] [seconds]   draws one frame into a picture and quits
+//   --snapshot <file.png> [missing|ready|importing|settings|mods|saves|levels|notes|shaders] [seconds]   draws one frame into a picture and quits
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +17,7 @@
 #include <bcrypt.h>
 #include <d2d1_1.h>
 #include <dwmapi.h>
+#include <dxgi1_6.h>
 #include <dwrite_1.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -28,7 +29,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -51,7 +54,7 @@ namespace {
 
 constexpr wchar_t kGameExe[] = L"TSFP.exe";
 constexpr wchar_t kXbe[] = L"default.xbe";
-constexpr wchar_t kVersion[] = L"LAUNCHER 1.1";
+constexpr wchar_t kVersion[] = L"LAUNCHER 1.2";
 constexpr float kWidth = 1060, kHeight = 700, kBar = 36, kBanner = 440;
 constexpr float kPi = 3.14159265f;
 
@@ -68,6 +71,35 @@ fs::path ExeDir() {
     wchar_t path[MAX_PATH * 4];
     DWORD n = GetModuleFileNameW(nullptr, path, DWORD(std::size(path)));
     return fs::path(std::wstring(path, n)).parent_path();
+}
+
+// launcher.log beside the exe: each step of the start, so a launcher that cannot open says how far it got
+void Log(const wchar_t* format, ...) {
+    wchar_t line[512];
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf_s(line, _TRUNCATE, format, args);
+    va_end(args);
+    static bool first = true;
+    std::wofstream file(ExeDir() / L"launcher.log", first ? std::ios::trunc : std::ios::app);
+    first = false;
+    file << line << L'\n';
+}
+
+// a start that cannot go on: the reason in a box (not a silent exit) and in the log
+[[noreturn]] void Fail(const wchar_t* what, HRESULT hr = S_OK) {
+    Log(L"failed: %s (0x%08X)", what, unsigned(hr));
+    std::wstring text = std::wstring(L"The launcher could not start: ") + what + L"\n\nThe details are in launcher.log beside it. "
+                        L"TSFP.exe can still be run directly.";
+    MessageBoxW(nullptr, text.c_str(), L"TSFP Launcher", MB_OK | MB_ICONERROR);
+    ExitProcess(1);
+}
+
+// a crash after the start shows too: where it was, in the box and the log
+LONG WINAPI Crashed(EXCEPTION_POINTERS* info) {
+    wchar_t what[160];
+    swprintf_s(what, L"a crash (code 0x%08X at %p)", unsigned(info->ExceptionRecord->ExceptionCode), info->ExceptionRecord->ExceptionAddress);
+    Fail(what);
 }
 
 // assets beside the exe or in a folder above it, as the game looks; else made beside the exe
@@ -189,11 +221,13 @@ struct Status {
     Check check{Found::Checking};
     bool busy = false;
     float progress = -1;  // 0-1 while copying
+    float prep = -1;      // 0-1 while the game prepares its shaders (PrepareThenPlay)
     std::wstring note;    // the last import's outcome, or an error
     bool error = false;
     // the updates
     Upd upd = Upd::Off;
     std::wstring version, latest, upd_note;  // installed, the latest release's, what the update is doing
+    std::wstring notes;                      // the latest release's notes, as plain text
     std::string url;                         // the latest release's TSFP.zip
     float upd_progress = -1;
 };
@@ -354,32 +388,39 @@ ComPtr<IDWriteTextFormat> Font(const wchar_t* family, float size, DWRITE_FONT_WE
 // the title's letters as a shape, to fill with chrome and outline: tracked, its bounds out
 ComPtr<ID2D1PathGeometry> TextShape(const wchar_t* text, const wchar_t* family, DWRITE_FONT_WEIGHT weight,
                                     float size, float tracking) {
-    ComPtr<IDWriteFontCollection> fonts;
-    g_dwrite->GetSystemFontCollection(&fonts);
-    UINT32 index = 0;
-    BOOL exists = FALSE;
-    fonts->FindFamilyName(family, &index, &exists);
-    if (!exists) fonts->FindFamilyName(L"Georgia", &index, &exists);
-    ComPtr<IDWriteFontFamily> fam;
-    ComPtr<IDWriteFont> font;
-    ComPtr<IDWriteFontFace> face;
-    fonts->GetFontFamily(index, &fam);
-    fam->GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font);
-    font->CreateFontFace(&face);
-    DWRITE_FONT_METRICS fm;
-    face->GetMetrics(&fm);
-    std::vector<UINT32> chars(text, text + wcslen(text));
-    std::vector<UINT16> glyphs(chars.size());
-    face->GetGlyphIndicesW(chars.data(), UINT32(chars.size()), glyphs.data());
-    std::vector<DWRITE_GLYPH_METRICS> gm(glyphs.size());
-    face->GetDesignGlyphMetrics(glyphs.data(), UINT32(glyphs.size()), gm.data(), FALSE);
-    std::vector<float> advances(glyphs.size());
-    for (size_t i = 0; i < glyphs.size(); i++) advances[i] = gm[i].advanceWidth * size / fm.designUnitsPerEm + tracking;
     ComPtr<ID2D1PathGeometry> shape;
     ComPtr<ID2D1GeometrySink> sink;
-    g_d2d->CreatePathGeometry(&shape);
-    shape->Open(&sink);
-    face->GetGlyphRunOutline(size, glyphs.data(), advances.data(), nullptr, UINT32(glyphs.size()), FALSE, FALSE, sink.Get());
+    if (FAILED(g_d2d->CreatePathGeometry(&shape)) || FAILED(shape->Open(&sink))) return shape;
+    // the glyphs' outline, when a font is found and answers at each step; else the shape stays empty (no title drawn)
+    [&] {
+        ComPtr<IDWriteFontCollection> fonts;
+        if (FAILED(g_dwrite->GetSystemFontCollection(&fonts))) return;
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        for (const wchar_t* name : {family, L"Georgia", L"Times New Roman", L"Segoe UI", L"Arial"})
+            if (SUCCEEDED(fonts->FindFamilyName(name, &index, &exists)) && exists) break;
+        if (!exists) {  // none of those on this PC (a trimmed Windows): the first family it has
+            if (!fonts->GetFontFamilyCount()) return;
+            index = 0;
+        }
+        ComPtr<IDWriteFontFamily> fam;
+        ComPtr<IDWriteFont> font;
+        ComPtr<IDWriteFontFace> face;
+        if (FAILED(fonts->GetFontFamily(index, &fam)) || !fam ||
+            FAILED(fam->GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font)) || !font ||
+            FAILED(font->CreateFontFace(&face)) || !face)
+            return;
+        DWRITE_FONT_METRICS fm;
+        face->GetMetrics(&fm);
+        std::vector<UINT32> chars(text, text + wcslen(text));
+        std::vector<UINT16> glyphs(chars.size());
+        if (!fm.designUnitsPerEm || FAILED(face->GetGlyphIndicesW(chars.data(), UINT32(chars.size()), glyphs.data()))) return;
+        std::vector<DWRITE_GLYPH_METRICS> gm(glyphs.size());
+        if (FAILED(face->GetDesignGlyphMetrics(glyphs.data(), UINT32(glyphs.size()), gm.data(), FALSE))) return;
+        std::vector<float> advances(glyphs.size());
+        for (size_t i = 0; i < glyphs.size(); i++) advances[i] = gm[i].advanceWidth * size / fm.designUnitsPerEm + tracking;
+        face->GetGlyphRunOutline(size, glyphs.data(), advances.data(), nullptr, UINT32(glyphs.size()), FALSE, FALSE, sink.Get());
+    }();
     sink->Close();
     return shape;
 }
@@ -483,6 +524,12 @@ struct Ui {
     double time = 0;
     float spawn = 0;
 } g_ui;
+// the latest release's notes shown in place of the page (DrawNotes)
+std::atomic<bool> g_notes_open{false};  // set by the update check's thread too
+float g_notes_scroll = 0;
+// started by an update (--updated): the new version's notes shown once they come
+std::atomic<bool> g_notes_after_update{false};
+
 
 float Random(float a, float b) { return std::uniform_real_distribution<float>(a, b)(g_ui.rng); }
 
@@ -551,7 +598,7 @@ void CreateResources(Gfx& g) {
         if (ComPtr<ID2D1Bitmap> b = Picture(rt, f)) g.slides.push_back(b);
     rt->CreateLinearGradientBrush({}, Stops(rt, {{0, Rgb(0x05070C, 0)}, {1, Rgb(0x05070C, 1)}}).Get(), &g.cover_fade);
     g.title = TextShape(L"TIMESPLITTERS", L"Palatino Linotype", DWRITE_FONT_WEIGHT_BOLD, 46, 1.5f);
-    g.title->GetBounds(nullptr, &g.title_bounds);
+    if (!g.title || FAILED(g.title->GetBounds(nullptr, &g.title_bounds))) g.title_bounds = {0, 0, 1, 1};  // no outline: nothing drawn
 
     // the exe's icon, top right
     HICON icon = HICON(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 256, 256, 0));
@@ -824,6 +871,52 @@ bool Enabled(int id, const Status& s) {
     }
 }
 
+// ---- the desktop shortcut ----------------------------------------------------------------------------------------
+
+// on the player's desktop, to this launcher (so a start looks for updates too), with its icon
+fs::path ShortcutFile() {
+    PWSTR desktop = nullptr;
+    fs::path file;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop)))
+        file = fs::path(desktop) / L"TimeSplitters Future Perfect.lnk";
+    CoTaskMemFree(desktop);
+    return file;
+}
+// looked up once a second at most: the play page is drawn every frame
+ULONGLONG g_shortcut_checked = 0;
+bool HasShortcut() {
+    static bool there = false;
+    ULONGLONG& checked = g_shortcut_checked;
+    if (!checked || GetTickCount64() - checked > 1000) {
+        std::error_code ec;
+        fs::path file = ShortcutFile();
+        there = !file.empty() && fs::exists(file, ec);
+        checked = GetTickCount64();
+    }
+    return there;
+}
+void SetShortcut(bool on) {
+    fs::path file = ShortcutFile();
+    if (file.empty()) return;
+    std::error_code ec;
+    if (!on) {
+        fs::remove(file, ec);
+    } else {
+        wchar_t self[MAX_PATH];
+        GetModuleFileNameW(nullptr, self, MAX_PATH);
+        ComPtr<IShellLinkW> link;
+        ComPtr<IPersistFile> save;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) {
+            link->SetPath(self);
+            link->SetWorkingDirectory(ExeDir().c_str());
+            link->SetIconLocation(self, 0);
+            link->SetDescription(L"TimeSplitters Future Perfect (recompiled)");
+            if (SUCCEEDED(link.As(&save))) save->Save(file.c_str(), TRUE);
+        }
+    }
+    g_shortcut_checked = 0;  // looked up again on the next frame
+}
+
 void DrawPlay(Gfx& g, const Status& s) {
     ID2D1RenderTarget* rt = g.rt.Get();
     float l = kBanner + 42, r = kWidth - 42;
@@ -856,6 +949,11 @@ void DrawPlay(Gfx& g, const Status& s) {
         body = L"Your copy is ready. Press F1 in the game for graphics, controls and co-op settings.";
         break;
     }
+    if (s.prep >= 0) {
+        heading = L"TUNING THE PORTAL";
+        body = L"Building the game's shaders for your graphics card before play, so the levels run without stutters. "
+               L"Only once, and again after a driver or game update.";
+    }
     Text(g, heading, g_fonts.title.Get(), {l, 152, r, 186}, kText, DWRITE_TEXT_ALIGNMENT_LEADING, 1.5f);
     Text(g, body, g_fonts.body.Get(), {l, 192, r, 262}, Rgb(0xC4C8D2));
 
@@ -872,7 +970,10 @@ void DrawPlay(Gfx& g, const Status& s) {
     // where it stands
     std::wstring line;
     D2D1_COLOR_F color = kDim;
-    if (s.busy && s.progress >= 0) {
+    if (s.prep >= 0) {
+        line = s.note;
+        color = kCyan;
+    } else if (s.busy && s.progress >= 0) {
         wchar_t pct[16];
         swprintf(pct, 16, L"%d%%", int(s.progress * 100));
         line = std::wstring(L"Importing\x2026 ") + pct;
@@ -888,11 +989,12 @@ void DrawPlay(Gfx& g, const Status& s) {
     }
     Text(g, line, g_fonts.note.Get(), {l, 404, r, 422}, color);
     Fill(g, {l, 428, r, 432}, Rgb(0x1E232D));
-    if (s.busy && s.progress > 0) {
+    float bar = s.prep >= 0 ? s.prep : s.progress;
+    if (s.busy && bar > 0) {
         g.play->SetStartPoint({l, 0});
         g.play->SetEndPoint({r, 0});
         g.play->SetOpacity(1);
-        rt->FillRectangle({l, 428, l + (r - l) * s.progress, 432}, g.play.Get());
+        rt->FillRectangle({l, 428, l + (r - l) * bar, 432}, g.play.Get());
     } else if (s.check.found == Found::Ready && !s.busy) {
         Fill(g, {l, 428, r, 432}, Rgb(0x52C8FF, 0.75f));
     }
@@ -939,12 +1041,28 @@ void DrawPlay(Gfx& g, const Status& s) {
     if (s.upd == Upd::Working && s.upd_progress >= 0) {
         Fill(g, {l, 643, r, 646}, Rgb(0x1E232D));
         Fill(g, {l, 643, l + (r - l) * s.upd_progress, 646}, Rgb(0x52C8FF, 0.9f));
+    } else if (!s.notes.empty() && (s.upd == Upd::Available || s.upd == Upd::Current)) {
+        std::wstring link = s.upd == Upd::Available ? L"What's new in " + s.latest + L"  \x203A"
+                                                    : L"What's new in this version  \x203A";
+        D2D1_RECT_F b = {l, 637, l + 260, 657};
+        int id = kButtons + int(g_ui.hot.size());
+        Text(g, link, g_fonts.label.Get(), b, g_ui.hover == id ? Rgb(0xFFFFFF) : kCyan, DWRITE_TEXT_ALIGNMENT_LEADING, 0.5f,
+             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        // where the click lands: the page is drawn kShift lower
+        g_ui.hot.push_back({{b.left, b.top + kShift, b.right, b.bottom + kShift}, [] { g_notes_open = true, g_notes_scroll = 0; }});
     } else {
         Text(g, L"Updates keep your game, saves and settings.", g_fonts.note.Get(), {l, 639, r, 657}, kFaint);
     }
 
     Text(g, std::wstring(L"TSFP RECOMP   /   ") + kVersion, g_fonts.note.Get(), {l, 670, r, 688}, Rgb(0x4A5060),
          DWRITE_TEXT_ALIGNMENT_LEADING, 1.5f);
+    // the desktop shortcut, made or taken away here
+    bool made = HasShortcut();
+    D2D1_RECT_F b = {r - 230, 668, r, 690};
+    int id = kButtons + int(g_ui.hot.size());
+    Text(g, made ? L"Remove desktop shortcut" : L"+  Desktop shortcut", g_fonts.note.Get(), b,
+         g_ui.hover == id ? kCyan : kDim, DWRITE_TEXT_ALIGNMENT_TRAILING, 0.5f, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    g_ui.hot.push_back({{b.left, b.top + kShift, b.right, b.bottom + kShift}, [made] { SetShortcut(!made); }});
     rt->SetTransform(was);
 }
 
@@ -974,7 +1092,13 @@ std::string Setting(const std::string& key, const std::string& def) {
         size_t eq = line.find('=');
         if (eq == std::string::npos || Trim(line.substr(0, eq)) != key) continue;
         std::string v = Trim(line.substr(eq + 1));
-        if (v.size() >= 2 && (v[0] == '\'' || v[0] == '"')) v = v.substr(1, v.size() - 2);
+        if (v.size() >= 2 && v[0] == '"') {
+            // a basic string, as the game writes them: its escapes undone (the backslashes of a monitor's device)
+            std::string out;
+            for (size_t i = 1; i + 1 < v.size(); i++) out += v[i] == '\\' && i + 2 < v.size() ? v[++i] : v[i];
+            return out;
+        }
+        if (v.size() >= 2 && v[0] == '\'') v = v.substr(1, v.size() - 2);
         return v;
     }
     return def;
@@ -1022,6 +1146,7 @@ struct Option {
     std::vector<std::wstring> names;
     std::function<int()> get;
     std::function<void(int)> set;
+    std::function<bool()> shown = nullptr;  // none: always
 };
 
 // the graphics presets, as the game's own settings panel has them: render scale, MSAA, texture sharpness, edge
@@ -1063,68 +1188,202 @@ Option Numbers(const wchar_t* label, const char* key, std::vector<int> values, i
             [key, values](int i) { SetSetting(key, std::to_string(values[size_t(i)])); }};
 }
 
-std::vector<Option> MakeOptions() {
+// the connected monitors by their Windows number (the game's monitor setting names one by its device)
+struct Monitor {
+    std::wstring device;
+    int number, width, height;
+    bool primary;
+};
+std::vector<Monitor> Monitors() {
+    std::vector<Monitor> out;
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR mon, HDC, LPRECT, LPARAM p) -> BOOL {
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+            const wchar_t* digits = std::wcsstr(mi.szDevice, L"DISPLAY");
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &dm);
+            reinterpret_cast<std::vector<Monitor>*>(p)->push_back({mi.szDevice, digits ? _wtoi(digits + 7) : 0,
+                                                                   int(dm.dmPelsWidth), int(dm.dmPelsHeight),
+                                                                   (mi.dwFlags & MONITORINFOF_PRIMARY) != 0});
+            return TRUE;
+        },
+        LPARAM(&out));
+    std::sort(out.begin(), out.end(), [](const Monitor& a, const Monitor& b) { return a.number < b.number; });
+    return out;
+}
+// the monitor setting's device, or the primary's when it is empty or unplugged
+std::wstring ChosenMonitor(const std::vector<Monitor>& monitors) {
+    std::wstring want = Wide(Setting("monitor", ""));
+    for (const Monitor& m : monitors)
+        if (!want.empty() && m.device == want) return m.device;
+    for (const Monitor& m : monitors)
+        if (m.primary) return m.device;
+    return {};
+}
+
+// the settings page's tabs, as the game's settings panel (F1) has them; its Mods and Co-op are the launcher's own
+// pages, the keys and Story's characters are set in the game
+enum SettingsTab { kSetDisplay, kSetGraphics, kSetControls, kSetGameplay, kSetEarly, kSetTabs };
+constexpr const wchar_t* kSettingsTabs[kSetTabs] = {L"DISPLAY", L"GRAPHICS", L"CONTROLS", L"GAMEPLAY", L"EARLY"};
+int g_settings_tab = kSetDisplay;
+float g_settings_scroll = 0;
+bool g_settings_stale = false;  // the monitor changed: its resolutions are listed again
+
+std::vector<Option> MakeOptions(int tab) {
     std::vector<Option> o;
-    o.push_back(Strings(L"Display mode", "display_mode", {L"Fullscreen", L"Borderless", L"Windowed"},
-                        {"fullscreen", "borderless", "windowed"}, "borderless"));
-    // the monitor's modes, largest first
-    std::vector<std::pair<int, int>> modes;
-    DEVMODEW dm{};
-    dm.dmSize = sizeof(dm);
-    for (DWORD i = 0; EnumDisplaySettingsW(nullptr, i, &dm); i++)
-        if (dm.dmPelsWidth >= 640 && dm.dmPelsHeight >= 480) modes.push_back({int(dm.dmPelsWidth), int(dm.dmPelsHeight)});
-    std::sort(modes.begin(), modes.end(), [](auto a, auto b) { return a.first * a.second > b.first * b.second; });
-    modes.erase(std::unique(modes.begin(), modes.end()), modes.end());
-    std::vector<std::wstring> names;
-    for (auto [w, h] : modes) names.push_back(std::to_wstring(w) + L" x " + std::to_wstring(h));
-    o.push_back({L"Resolution", names,
-                 [modes] {
-                     int w = SettingInt("width", 0), h = SettingInt("height", 0);
-                     for (size_t i = 0; i < modes.size(); i++)
-                         if (modes[i].first == w && modes[i].second == h) return int(i);
-                     return 0;
-                 },
-                 [modes](int i) {
-                     SetSetting("width", std::to_string(modes[size_t(i)].first));
-                     SetSetting("height", std::to_string(modes[size_t(i)].second));
-                 }});
-    std::vector<std::wstring> presets;
-    for (const Preset& p : kPresets) presets.push_back(p.name);
-    presets.push_back(L"Custom");
-    o.push_back({L"Graphics preset", presets,
-                 [] {
-                     for (size_t i = 0; i < std::size(kPresets); i++) {
+    auto on = [](const char* key, bool def) { return [key, def] { return SettingBool(key, def); }; };
+    if (tab == kSetDisplay) {
+        o.push_back(Strings(L"Display mode", "display_mode", {L"Fullscreen", L"Borderless", L"Windowed"},
+                            {"fullscreen", "borderless", "windowed"}, "borderless"));
+        std::vector<Monitor> monitors = Monitors();
+        if (monitors.size() > 1) {
+            std::vector<std::wstring> names;
+            for (const Monitor& m : monitors)
+                names.push_back(L"Display " + std::to_wstring(m.number) + L"  (" + std::to_wstring(m.width) + L"x" +
+                                std::to_wstring(m.height) + (m.primary ? L", main)" : L")"));
+            o.push_back({L"Monitor", names,
+                         [monitors] {
+                             std::wstring at = ChosenMonitor(monitors);
+                             for (size_t i = 0; i < monitors.size(); i++)
+                                 if (monitors[i].device == at) return int(i);
+                             return 0;
+                         },
+                         [monitors](int i) {
+                             const Monitor& m = monitors[size_t(i)];
+                             std::string device;
+                             for (wchar_t c : m.device) device += char(c);
+                             SetSetting("monitor", m.primary ? "''" : Quoted(device));
+                             // its own desktop size, as the game does on a change
+                             SetSetting("width", "0");
+                             SetSetting("height", "0");
+                             g_settings_stale = true;
+                         }});
+        }
+        // the chosen monitor's desktop, then its modes, largest first
+        std::wstring device = ChosenMonitor(monitors);
+        std::vector<std::pair<int, int>> modes;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        for (DWORD i = 0; EnumDisplaySettingsW(device.empty() ? nullptr : device.c_str(), i, &dm); i++)
+            if (dm.dmPelsWidth >= 640 && dm.dmPelsHeight >= 480) modes.push_back({int(dm.dmPelsWidth), int(dm.dmPelsHeight)});
+        std::sort(modes.begin(), modes.end(), [](auto a, auto b) { return a.first * a.second > b.first * b.second; });
+        modes.erase(std::unique(modes.begin(), modes.end()), modes.end());
+        modes.insert(modes.begin(), {0, 0});
+        std::vector<std::wstring> names;
+        for (auto [w, h] : modes) names.push_back(w ? std::to_wstring(w) + L" x " + std::to_wstring(h) : L"Desktop");
+        o.push_back({L"Resolution", names,
+                     [modes] {
+                         int w = SettingInt("width", 0), h = SettingInt("height", 0);
+                         for (size_t i = 0; i < modes.size(); i++)
+                             if (modes[i].first == w && modes[i].second == h) return int(i);
+                         return 0;
+                     },
+                     [modes](int i) {
+                         SetSetting("width", std::to_string(modes[size_t(i)].first));
+                         SetSetting("height", std::to_string(modes[size_t(i)].second));
+                     }});
+        o.push_back(Numbers(L"Render scale", "render_percent", {50, 67, 75, 85, 100, 125, 150, 175, 200}, 100, L"%"));
+        o.push_back(Strings(L"Aspect ratio", "aspect_ratio", {L"Auto", L"4:3", L"16:9", L"16:10", L"21:9", L"32:9"},
+                            {"auto", "4:3", "16:9", "16:10", "21:9", "32:9"}, "auto"));
+        o.push_back(Numbers(L"Brightness", "brightness", {50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150}, 100, L"%"));
+        o.push_back(Switch(L"HDR", "hdr", false));
+        Option white = Numbers(L"HDR white", "hdr_white", {0, 100, 150, 200, 250, 300, 400, 500}, 0, L" nits");
+        white.names[0] = L"Windows'";
+        white.shown = on("hdr", false);
+        o.push_back(white);
+        Option peak = Numbers(L"HDR highlights", "hdr_peak", {0, 400, 600, 800, 1000, 1500, 2000, 4000}, 0, L" nits");
+        peak.names[0] = L"The display's";
+        peak.shown = on("hdr", false);
+        o.push_back(peak);
+        o.push_back(Switch(L"Vertical sync", "vsync", true));
+        o.push_back(Switch(L"Low latency", "low_latency", true));
+        o.push_back(Switch(L"Show frame rate", "show_fps", false));
+        o.push_back(Switch(L"Show performance stats", "show_stats", false));
+        o.push_back(Switch(L"Log performance", "log_stats", false));
+    } else if (tab == kSetGraphics) {
+        std::vector<std::wstring> presets;
+        for (const Preset& p : kPresets) presets.push_back(p.name);
+        presets.push_back(L"Custom");
+        o.push_back({L"Graphics preset", presets,
+                     [] {
+                         for (size_t i = 0; i < std::size(kPresets); i++) {
+                             const Preset& p = kPresets[i];
+                             if (SettingInt("render_percent", 100) == p.render && SettingInt("msaa", 0) == p.msaa &&
+                                 SettingInt("anisotropic_filtering", 0) == p.aniso &&
+                                 std::min(SettingInt("edge_smoothing", 0), 2) == p.edge &&
+                                 std::min(SettingInt("ambient_occlusion", 0), 2) == p.ao)
+                                 return int(i);
+                         }
+                         return int(std::size(kPresets));
+                     },
+                     [](int i) {
+                         if (i >= int(std::size(kPresets))) return;
                          const Preset& p = kPresets[i];
-                         if (SettingInt("render_percent", 100) == p.render && SettingInt("msaa", 0) == p.msaa &&
-                             SettingInt("anisotropic_filtering", 0) == p.aniso &&
-                             std::min(SettingInt("edge_smoothing", 0), 2) == p.edge &&
-                             std::min(SettingInt("ambient_occlusion", 0), 2) == p.ao)
-                             return int(i);
-                     }
-                     return int(std::size(kPresets));
-                 },
-                 [](int i) {
-                     if (i >= int(std::size(kPresets))) return;
-                     const Preset& p = kPresets[i];
-                     SetSetting("render_percent", std::to_string(p.render));
-                     SetSetting("msaa", std::to_string(p.msaa));
-                     SetSetting("anisotropic_filtering", std::to_string(p.aniso));
-                     SetSetting("edge_smoothing", std::to_string(p.edge));
-                     SetSetting("ambient_occlusion", std::to_string(p.ao));
-                 }});
-    o.push_back(Numbers(L"Render scale", "render_percent", {50, 67, 75, 85, 100, 125, 150, 175, 200}, 100, L"%"));
-    o.push_back(Strings(L"Aspect ratio", "aspect_ratio", {L"Auto", L"4:3", L"16:9", L"16:10", L"21:9", L"32:9"},
-                        {"auto", "4:3", "16:9", "16:10", "21:9", "32:9"}, "auto"));
-    o.push_back(Numbers(L"Field of view", "fov", {40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100}, 55, L"\x00B0"));
-    o.push_back(Switch(L"Vertical sync", "vsync", true));
-    o.push_back(Switch(L"HDR", "hdr", false));
-    o.push_back({L"HUD style", {L"Future Perfect", L"TimeSplitters 2", L"TimeSplitters 1"},
-                 [] { return std::clamp(SettingInt("hud_style", 0), 0, 2); },
-                 [](int i) { SetSetting("hud_style", std::to_string(i)); }});
-    o.push_back(Strings(L"Language", "language", {L"English", L"Fran\x00E7" L"ais", L"Deutsch", L"Espa\x00F1ol", L"Italiano"},
-                        {"english", "french", "german", "spanish", "italian"}, "english"));
-    o.push_back(Switch(L"Skip intro videos", "skip_intros", false));
-    o.push_back(Switch(L"Fast loading", "fast_loading", false));
+                         SetSetting("render_percent", std::to_string(p.render));
+                         SetSetting("msaa", std::to_string(p.msaa));
+                         SetSetting("anisotropic_filtering", std::to_string(p.aniso));
+                         SetSetting("edge_smoothing", std::to_string(p.edge));
+                         SetSetting("ambient_occlusion", std::to_string(p.ao));
+                     }});
+        o.push_back(Numbers(L"Field of view", "fov", {40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100}, 55, L"\x00B0"));
+        o.push_back(Numbers(L"Weapon field of view", "weapon_fov", {30, 35, 40, 45, 50, 55, 60, 65, 70}, 45, L"\x00B0"));
+        o.push_back(Switch(L"Hands", "hands", true));
+        Option aniso = Numbers(L"Texture sharpness", "anisotropic_filtering", {0, 2, 4, 8, 16}, 0, L"x");
+        aniso.names[0] = L"As the game asks";
+        o.push_back(aniso);
+        Option msaa = Numbers(L"MSAA", "msaa", {0, 2, 4, 8}, 0, L"x");
+        msaa.names[0] = L"Off";
+        o.push_back(msaa);
+        o.push_back({L"Edge smoothing", {L"Off", L"FXAA", L"SMAA"},
+                     [] { return std::clamp(SettingInt("edge_smoothing", 0), 0, 2); },
+                     [](int i) { SetSetting("edge_smoothing", std::to_string(i)); }});
+        o.push_back({L"Ambient occlusion", {L"Off", L"SSAO", L"GTAO"},
+                     [] { return std::clamp(SettingInt("ambient_occlusion", 0), 0, 2); },
+                     [](int i) { SetSetting("ambient_occlusion", std::to_string(i)); }});
+        o.push_back(Switch(L"Seal seams", "seal_seams", true));
+        o.push_back(Switch(L"Console depth ties", "depth_ties", true));
+        o.push_back(Switch(L"Fog", "fog", true));
+        o.push_back(Switch(L"Rain", "rain", true));
+        o.push_back(Switch(L"Blood", "blood", true));
+    } else if (tab == kSetControls) {
+        o.push_back(Numbers(L"Mouse sensitivity", "mouse_sensitivity",
+                            {5, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500}, 100, L""));
+        o.push_back(Numbers(L"Up and down speed", "mouse_vertical", {25, 50, 75, 100, 125, 150, 175, 200}, 100, L"%"));
+        o.push_back(Switch(L"Invert up and down", "invert_mouse", false));
+        o.push_back(Numbers(L"Stick dead zone", "stick_deadzone", {0, 2, 4, 6, 8, 10, 12, 15, 20, 25, 30}, 8, L"%"));
+        o.push_back(Numbers(L"Aim curve", "stick_curve", {100, 125, 150, 175, 200, 225, 250}, 150, L""));
+        o.push_back(Switch(L"Gyro aiming", "gyro_aim", false));
+        Option gyro = Numbers(L"Gyro speed", "gyro_speed", {50, 100, 150, 200, 300, 400, 600, 800}, 200, L"%");
+        gyro.shown = on("gyro_aim", false);
+        o.push_back(gyro);
+        o.push_back(Switch(L"Keyboard on its own player", "keyboard_own_port", true));
+    } else if (tab == kSetGameplay) {
+        o.push_back(Switch(L"Skip intro videos", "skip_intros", true));
+        o.push_back(Switch(L"Skip any cutscene", "skip_any_cutscene", true));
+        o.push_back(Switch(L"Fast loading", "fast_loading", true));
+        o.push_back(Switch(L"Player names in co-op", "player_names", true));
+        o.push_back(Strings(L"Language", "language", {L"English", L"Fran\x00E7" L"ais", L"Deutsch", L"Espa\x00F1ol", L"Italiano"},
+                            {"english", "french", "german", "spanish", "italian"}, "english"));
+        o.push_back(Switch(L"Pause in the background", "pause_unfocused", false));
+        o.push_back({L"Audio output", {L"Automatic", L"Mono", L"Stereo", L"5.1 Surround"},
+                     [] { return std::clamp(SettingInt("audio_output", 0), 0, 3); },
+                     [](int i) { SetSetting("audio_output", std::to_string(i)); }});
+        o.push_back(Switch(L"Discord status", "discord", true));
+    } else {
+        o.push_back({L"Font", {L"Future Perfect", L"TimeSplitters 2", L"Arial Bold (early)"},
+                     [] { return std::clamp(SettingInt("font", 0), 0, 2); },
+                     [](int i) { SetSetting("font", std::to_string(i)); }});
+        o.push_back({L"HUD style", {L"Future Perfect", L"TimeSplitters 2", L"TimeSplitters 1"},
+                     [] { return std::clamp(SettingInt("hud_style", 0), 0, 2); },
+                     [](int i) { SetSetting("hud_style", std::to_string(i)); }});
+        o.push_back({L"Breaking and Entering skyline", {L"Future Perfect", L"Early (2004)"},
+                     [] { return std::clamp(SettingInt("skyline_model", 0), 0, 1); },
+                     [](int i) { SetSetting("skyline_model", std::to_string(i)); }});
+    }
     return o;
 }
 
@@ -1167,15 +1426,43 @@ void DrawFlat(Gfx& g, D2D1_RECT_F b, const wchar_t* text, std::function<void()> 
 }
 
 void DrawSettings(Gfx& g) {
-    static std::vector<Option> options = MakeOptions();
-    float l = kBanner + 42, r = kWidth - 42, y = 160;
-    Text(g, L"Read by the game when it starts. Everything else is in its own settings panel: F1 in the game.",
-         g_fonts.note.Get(), {l, y, r, y + 18}, kDim);
-    y += 28;
-    for (const Option& o : options) {
-        DrawOption(g, o, y, l, r);
-        y += 38;
+    static std::vector<Option> options[kSetTabs];
+    static bool made[kSetTabs] = {};
+    if (g_settings_stale) made[kSetDisplay] = false, g_settings_stale = false;
+    if (!made[g_settings_tab]) options[g_settings_tab] = MakeOptions(g_settings_tab), made[g_settings_tab] = true;
+    ID2D1RenderTarget* rt = g.rt.Get();
+    float l = kBanner + 42, r = kWidth - 42, y = 158;
+    float x = l, gap = 8, w = (r - l - gap * float(kSetTabs - 1)) / float(kSetTabs);
+    for (int t = 0; t < kSetTabs; t++) {
+        D2D1_RECT_F b = {x, y, x + w, y + 28};
+        int id = kButtons + int(g_ui.hot.size());
+        bool on = g_settings_tab == t, hover = g_ui.hover == id;
+        Fill(g, b, on ? Rgb(0x1E5E8C) : hover ? Rgb(0x232A37) : kButton);
+        g.brush->SetColor(on ? kCyan : Rgb(0x343B49));
+        rt->DrawRectangle(b, g.brush.Get(), 1);
+        Text(g, kSettingsTabs[t], g_fonts.label.Get(), b, on ? Rgb(0xFFFFFF) : kText, DWRITE_TEXT_ALIGNMENT_CENTER, 1.5f,
+             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        g_ui.hot.push_back({b, [t] { g_settings_tab = t, g_settings_scroll = 0; }});
+        x += w + gap;
     }
+    y += 40;
+    // the rows shown, scrolled by the wheel when they do not fit
+    std::vector<const Option*> rows;
+    for (const Option& o : options[g_settings_tab])
+        if (!o.shown || o.shown()) rows.push_back(&o);
+    const float row = 36, bottom = kHeight - 40;
+    int fit = int((bottom - y) / row), most = std::max(0, int(rows.size()) - fit);
+    g_settings_scroll = std::clamp(g_settings_scroll, 0.f, float(most));
+    int first = int(g_settings_scroll);
+    for (int i = first; i < int(rows.size()) && i < first + fit; i++) {
+        DrawOption(g, *rows[size_t(i)], y, l, r);
+        y += row;
+    }
+    std::wstring foot = g_settings_tab == kSetControls
+                            ? L"The keys are set in the game: F1 > Controls."
+                            : L"Read by the game when it starts; the same as its settings panel, F1 in the game.";
+    if (most) foot += L"  Scroll for more.";
+    Text(g, foot, g_fonts.note.Get(), {l, kHeight - 30, r, kHeight - 12}, kFaint);
 }
 
 // mods/<folder> with its mod.toml (name, description); off when the setting mods_off lists the folder
@@ -1494,6 +1781,42 @@ void DrawSaves(Gfx& g) {
     });
 }
 
+void Press(int id);
+
+// the latest release's notes in place of the page, scrolled by the wheel: back, and the update from here
+void DrawNotes(Gfx& g, const Status& s) {
+    ID2D1RenderTarget* rt = g.rt.Get();
+    float l = kBanner + 42, r = kWidth - 42, y = 160;
+    bool newer = s.upd == Upd::Available;
+    std::wstring title = newer ? L"WHAT'S NEW IN " + s.latest : L"WHAT'S NEW IN " + s.version;
+    Text(g, title, g_fonts.label.Get(), {l, y, r, y + 20}, kCyan, DWRITE_TEXT_ALIGNMENT_LEADING, 1.5f);
+    y += 30;
+    const float bottom = kHeight - 84;
+    ComPtr<IDWriteTextLayout> layout;
+    g_dwrite->CreateTextLayout(s.notes.c_str(), UINT32(s.notes.size()), g_fonts.body.Get(), r - l, 100000, &layout);
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    float most = std::max(0.f, m.height - (bottom - y));
+    g_notes_scroll = std::clamp(g_notes_scroll, 0.f, most);
+    rt->PushAxisAlignedClip({l, y, r, bottom}, D2D1_ANTIALIAS_MODE_ALIASED);
+    g.brush->SetColor(Rgb(0xC4C8D2));
+    rt->DrawTextLayout({l, y - g_notes_scroll}, layout.Get(), g.brush.Get());
+    rt->PopAxisAlignedClip();
+    if (most > 0) {
+        // where the view is in the notes
+        float h = bottom - y, bar = std::max(24.f, h * h / (h + most)), at = y + (h - bar) * (g_notes_scroll / most);
+        Fill(g, {r + 10, y, r + 13, bottom}, Rgb(0x1E232D));
+        Fill(g, {r + 10, at, r + 13, at + bar}, Rgb(0x52C8FF, 0.7f));
+    }
+    float third = (r - l - 16) / 3;
+    DrawFlat(g, {l, kHeight - 70, l + third, kHeight - 32}, L"\x2039  BACK", [] { g_notes_open = false; });
+    if (newer)
+        DrawFlat(g, {r - third * 1.4f, kHeight - 70, r, kHeight - 32}, L"UPDATE NOW", [] {
+            g_notes_open = false;
+            Press(kUpdate);
+        });
+}
+
 // the right side: the title, the page names, the page shown
 void DrawPage(Gfx& g, const Status& s) {
     ID2D1RenderTarget* rt = g.rt.Get();
@@ -1513,10 +1836,11 @@ void DrawPage(Gfx& g, const Status& s) {
         Text(g, kPageNames[i], g_fonts.label.Get(), tab, on ? kText : hover ? kCyan : kDim, DWRITE_TEXT_ALIGNMENT_LEADING,
              2, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         if (on) Fill(g, {tab.left, 144, tab.right - 18, 146}, kCyan);
-        g_ui.hot.push_back({tab, [i] { g_ui.page = i; }});
+        g_ui.hot.push_back({tab, [i] { g_ui.page = i, g_notes_open = false; }});
         x += w + 8;
     }
     Fill(g, {l, 146, r, 147}, kLine);
+    if (g_notes_open) return DrawNotes(g, s);
     switch (g_ui.page) {
     case kPageSettings: DrawSettings(g); break;
     case kPageMods: DrawMods(g); break;
@@ -1583,17 +1907,29 @@ void Resize() {
     }
 }
 
-void CreateTarget() {
+// the window's render target on the graphics card, else (a driver or a screen mode Direct2D cannot use it on) in software
+bool CreateTarget() {
     RECT rc;
     GetClientRect(g_window, &rc);
     ComPtr<ID2D1HwndRenderTarget> hwnd;
-    g_d2d->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                                     D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96 * g_scale, 96 * g_scale),
-        D2D1::HwndRenderTargetProperties(g_window, D2D1::SizeU(rc.right, rc.bottom)), &hwnd);
+    for (D2D1_RENDER_TARGET_TYPE type : {D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE}) {
+        HRESULT hr = g_d2d->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(type, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                                         96 * g_scale, 96 * g_scale),
+            D2D1::HwndRenderTargetProperties(g_window, D2D1::SizeU(rc.right, rc.bottom)), &hwnd);
+        if (SUCCEEDED(hr) && hwnd) {
+            Log(L"render target: %s", type == D2D1_RENDER_TARGET_TYPE_DEFAULT ? L"graphics card" : L"software");
+            break;
+        }
+        Log(L"render target %s failed (0x%08X)", type == D2D1_RENDER_TARGET_TYPE_DEFAULT ? L"on the graphics card" : L"in software",
+            unsigned(hr));
+        hwnd.Reset();
+    }
     g_gfx = {};
+    if (!hwnd) return false;
     g_gfx.rt = hwnd;
     CreateResources(g_gfx);
+    return true;
 }
 
 void Launch(const std::wstring& args) {
@@ -1736,6 +2072,63 @@ std::string JsonString(const std::string& json, const std::string& key, size_t a
     return e == std::string::npos ? std::string() : json.substr(q + 1, e - q - 1);
 }
 
+// a JSON string's text, its escapes undone (\n, \", \uXXXX...), as UTF-16
+std::wstring JsonText(const std::string& json, const std::string& key) {
+    size_t k = json.find("\"" + key + "\"");
+    if (k == std::string::npos) return {};
+    size_t q = json.find('"', json.find(':', k) + 1);
+    if (q == std::string::npos) return {};
+    std::string utf8;
+    for (size_t i = q + 1; i < json.size() && json[i] != '"'; i++) {
+        if (json[i] != '\\' || i + 1 >= json.size()) {
+            utf8 += json[i];
+            continue;
+        }
+        char e = json[++i];
+        if (e == 'n') utf8 += '\n';
+        else if (e == 't') utf8 += ' ';
+        else if (e == 'r') continue;
+        else if (e == 'u' && i + 4 < json.size()) {
+            unsigned c = unsigned(std::strtoul(json.substr(i + 1, 4).c_str(), nullptr, 16));
+            i += 4;
+            // as UTF-8 (a surrogate pair's halves each on their own: the notes have none worth the trouble)
+            if (c < 0x80) utf8 += char(c);
+            else if (c < 0x800) utf8 += char(0xC0 | (c >> 6)), utf8 += char(0x80 | (c & 0x3F));
+            else utf8 += char(0xE0 | (c >> 12)), utf8 += char(0x80 | ((c >> 6) & 0x3F)), utf8 += char(0x80 | (c & 0x3F));
+        } else utf8 += e;
+    }
+    return Wide(utf8);
+}
+
+// release notes as written on GitHub (Markdown) made plain: bullets, no bold, headings and links as their text
+std::wstring PlainNotes(const std::wstring& md) {
+    std::wstring out, line;
+    auto flush = [&] {
+        size_t a = line.find_first_not_of(L' ');
+        std::wstring t = a == std::wstring::npos ? L"" : line.substr(a);
+        if (t.rfind(L"- ", 0) == 0 || t.rfind(L"* ", 0) == 0) t = L"\x2022  " + t.substr(2);
+        while (!t.empty() && t[0] == L'#') t.erase(0, 1);
+        if (!t.empty() && t[0] == L' ') t.erase(0, 1);
+        for (size_t at; (at = t.find(L"**")) != std::wstring::npos;) t.erase(at, 2);
+        for (size_t at; (at = t.find(L'`')) != std::wstring::npos;) t.erase(at, 1);
+        // [text](address): the text
+        for (size_t open; (open = t.find(L"](")) != std::wstring::npos;) {
+            size_t start = t.rfind(L'[', open), close = t.find(L')', open);
+            if (start == std::wstring::npos || close == std::wstring::npos) break;
+            t = t.substr(0, start) + t.substr(start + 1, open - start - 1) + t.substr(close + 1);
+        }
+        out += t + L"\n";
+        line.clear();
+    };
+    for (wchar_t c : md) {
+        if (c == L'\n') flush();
+        else line += c;
+    }
+    if (!line.empty()) flush();
+    while (!out.empty() && (out.back() == L'\n' || out.back() == L' ')) out.pop_back();
+    return out;
+}
+
 void CheckUpdate() {
     Update([](Status& s) { s.upd = Upd::Checking; });
     std::string json;
@@ -1758,8 +2151,10 @@ void CheckUpdate() {
         at = json.find("browser_download_url", end);
         if (at != std::string::npos) at += 20;
     }
+    std::wstring notes = PlainNotes(JsonText(json, "body"));
+    if (g_notes_after_update && !notes.empty()) g_notes_open = true, g_notes_after_update = false;
     Update([&](Status& s) {
-        s.latest = Wide(tag), s.url = url;
+        s.latest = Wide(tag), s.url = url, s.notes = notes;
         if (tag.empty() || url.empty()) s.upd = Upd::Failed, s.upd_note = L"The latest release has no TSFP.zip.";
         else s.upd = s.latest == s.version ? Upd::Current : Upd::Available;
     });
@@ -1868,6 +2263,96 @@ void StartUpdates() {
     if (!g_repo.empty()) std::thread(CheckUpdate).detach();
 }
 
+// ---- the shaders, prepared before play -------------------------------------------------------------------------
+
+constexpr UINT kPlayNow = WM_APP + 1;  // the preparation is done: the game starts from the window's thread
+
+// the line the game writes into pipelines.stamp when it prepared them (gpu/d3d12.cpp, PrepareStamp): the GPU it
+// picks (the fastest), its driver, and the shipped seeds' sizes
+std::wstring ShaderStamp() {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+    ComPtr<IDXGIFactory6> f6;
+    ComPtr<IDXGIAdapter1> adapter;
+    if (SUCCEEDED(factory.As(&f6))) f6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+    if (!adapter) factory->EnumAdapters1(0, &adapter);
+    DXGI_ADAPTER_DESC1 d{};
+    LARGE_INTEGER umd{};
+    if (adapter) {
+        adapter->GetDesc1(&d);
+        adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd);
+    }
+    std::error_code ec;
+    auto size = [&](const wchar_t* name) {
+        uintmax_t n = fs::file_size(ExeDir() / name, ec);
+        return ec ? 0ull : (unsigned long long)n;
+    };
+    wchar_t line[128];
+    swprintf(line, std::size(line), L"1 %04X %04X %016llX %llu %llu", d.VendorId, d.DeviceId,
+             (unsigned long long)umd.QuadPart, size(L"pipekeys_seed.bin"), size(L"shaders_seed.bin"));
+    return line;
+}
+
+// the release ships pipelines to make (pipekeys_seed.bin) and they were not made yet for this GPU, driver and release
+bool NeedsShaders() {
+    std::error_code ec;
+    if (!fs::exists(ExeDir() / L"pipekeys_seed.bin", ec)) return false;
+    return ReadLine(ExeDir() / L"pipelines.stamp") != ShaderStamp();
+}
+
+// TSFP.exe --prepare-shaders, its "done total" lines read from its output as they come; then the game. A preparation
+// that fails stops nothing: the game makes what is missing as it plays, as before
+void PrepareThenPlay() {
+    auto progress = [](size_t done, size_t total) {
+        Update([&](Status& st) {
+            st.prep = total ? float(done) / float(total) : 0.f;
+            st.note = L"Preparing shaders for your graphics card\x2026 " + std::to_wstring(done) + L" / " +
+                      std::to_wstring(total);
+        });
+    };
+    progress(0, 0);
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE read = nullptr, write = nullptr;
+    bool ran = false;
+    if (CreatePipe(&read, &write, &sa, 0)) {
+        SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
+        fs::path exe = ExeDir() / kGameExe;
+        std::wstring cmd = L"\"" + exe.wstring() + L"\" --prepare-shaders";
+        STARTUPINFOW si{sizeof(si)};
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = write;
+        si.hStdError = write;
+        PROCESS_INFORMATION pi{};
+        ran = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, ExeDir().c_str(), &si, &pi);
+        CloseHandle(write);
+        if (ran) {
+            std::string pending;
+            char buf[256];
+            DWORD n = 0;
+            while (::ReadFile(read, buf, sizeof(buf), &n, nullptr) && n) {
+                pending.append(buf, n);
+                for (size_t nl; (nl = pending.find('\n')) != std::string::npos; pending.erase(0, nl + 1)) {
+                    unsigned long long done = 0, total = 0;
+                    if (std::sscanf(pending.substr(0, nl).c_str(), "%llu %llu", &done, &total) == 2)
+                        progress(size_t(done), size_t(total));
+                }
+            }
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        CloseHandle(read);
+    }
+    Update([](Status& st) { st.busy = false, st.prep = -1, st.note.clear(); });
+    PostMessageW(g_window, kPlayNow, 0, 0);
+}
+
+void Play() {
+    if (!NeedsShaders()) return Launch(L"");
+    Update([](Status& st) { st.busy = true; });
+    std::thread(PrepareThenPlay).detach();
+}
+
 void Press(int id) {
     if (id >= kButtons) {
         if (size_t(id - kButtons) < g_ui.hot.size()) {
@@ -1883,7 +2368,7 @@ void Press(int id) {
         if (s.busy) g_cancel = true;
         else Browse();
         break;
-    case kPlay: Launch(L""); break;
+    case kPlay: Play(); break;
     case kVerify:
         Update([](Status& st) { st.busy = true, st.check.found = Found::Checking, st.note.clear(); });
         std::thread([] {
@@ -1908,7 +2393,7 @@ void Press(int id) {
 
 int HitButton(LPARAM lp) {
     float x = GET_X_LPARAM(lp) / g_scale, y = GET_Y_LPARAM(lp) / g_scale;
-    for (int id = g_ui.page == kPagePlay ? 0 : kMinimize; id < kButtons; id++) {
+    for (int id = g_ui.page == kPagePlay && !g_notes_open ? 0 : kMinimize; id < kButtons; id++) {
         const D2D1_RECT_F& r = g_ui.buttons[id].rect;
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return id;
     }
@@ -1938,8 +2423,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE: g_ui.hover = -1; return 0;
+    case kPlayNow: Launch(L""); return 0;
     case WM_MOUSEWHEEL:
         if (g_ui.page == kPageSaves) g_saves_scroll -= float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 2;
+        if (g_ui.page == kPageSettings) g_settings_scroll -= float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 2;
+        if (g_notes_open) g_notes_scroll -= float(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 60;
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT && g_ui.hover >= 0 &&
@@ -2001,6 +2489,13 @@ int Snapshot(const std::wstring& file, const std::wstring& state, double time) {
     else if (state == L"glitch") s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}};
     else s.check = {Found::Missing};
     s.version = L"2026.10.29.1415", s.upd = Upd::Available, s.latest = L"2026.10.30.0900";
+    s.notes = PlainNotes(L"## Changes\n\n- **Pause in the background:** the game and its sound stop while another window is "
+                         L"in front.\n- **Audio output:** Automatic, Mono, Stereo or 5.1 Surround.\n- **Monitor:** pick "
+                         L"the one the game shows on. See [the readme](https://example.com).");
+    if (state == L"shaders")
+        s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}}, s.busy = true, s.prep = 0.47f,
+        s.note = L"Preparing shaders for your graphics card\x2026 1212 / 2579";
+    if (state == L"notes") s.check = {Found::Ready, L"TimeSplitters - Future Perfect (USA).iso", {}}, g_notes_open = true;
     g_ui.hover = state == L"ready" ? kPlay : -1;
     for (int i = 0; i < 240; i++) Simulate(1 / 60.f);
     g_ui.time = time >= 0 ? time : state == L"glitch" ? 6.85 : 2.2;
@@ -2024,11 +2519,17 @@ int Snapshot(const std::wstring& file, const std::wstring& state, double time) {
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
+    SetUnhandledExceptionFilter(Crashed);
+    Log(L"launcher starting");
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2d.GetAddressOf());
-    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(g_dwrite.GetAddressOf()));
-    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic));
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2d.GetAddressOf());
+    if (FAILED(hr) || !g_d2d) Fail(L"Direct2D is not available", hr);
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(g_dwrite.GetAddressOf()));
+    if (FAILED(hr) || !g_dwrite) Fail(L"DirectWrite is not available", hr);
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic));
+    if (FAILED(hr) || !g_wic) Fail(L"the Windows imaging component is not available", hr);
+    Log(L"factories made");
     CreateFonts();
     Layout();
 
@@ -2083,15 +2584,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
                                WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                                work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2, w, h,
                                nullptr, nullptr, inst, nullptr);
+    if (!g_window) Fail(L"the window could not be made", HRESULT_FROM_WIN32(GetLastError()));
+    Log(L"window made");
     DWORD round = 2;  // DWMWCP_ROUND, on Windows 11
     DwmSetWindowAttribute(g_window, 33, &round, sizeof(round));
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g_window, 20, &dark, sizeof(dark));
 
-    CreateTarget();
+    if (!CreateTarget()) Fail(L"Direct2D could not draw into the window, on the graphics card or in software");
     DragAcceptFiles(g_window, TRUE);
     ShowWindow(g_window, show);
     std::thread([] { Rescan(); }).detach();
+    g_notes_after_update = std::wcsstr(GetCommandLineW(), L"--updated") != nullptr;
     StartUpdates();
 
     // drawn each frame the screen shows, the portal moving
@@ -2114,7 +2618,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         }
         g_ui.time += dt;
         Simulate(dt);
-        if (Draw(g_gfx) == D2DERR_RECREATE_TARGET) CreateTarget();
+        if (Draw(g_gfx) == D2DERR_RECREATE_TARGET && !CreateTarget()) Fail(L"Direct2D lost the window's drawing surface and could not make it again");
         DwmFlush();  // paced by the compositor
     }
 }

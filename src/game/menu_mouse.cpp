@@ -13,6 +13,7 @@
 // +0x20 caption, +0x28 flags (1 and 4 disabled or hidden), +0x78..+0x84 its rectangle, +0x88 its menu, +0xB4 1 a
 // choice, +0xB8 style, +0xC8 the choice. Rectangles are pixels of the UI canvas at 0x4E8CF0 x 0x4E8CF4.
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include "common/mouse.h"
 #include "core/log.h"
 #include "kernel/memory.h"
+#include "xdk/d3d8.h"
 #include "xdk/hle.h"
 
 namespace {
@@ -288,8 +290,12 @@ struct ProfilePrompt {
     uint32_t menu, row, caption;
     float x, y, w, h;
     uint64_t time;
+    uint32_t text, start, stop, next, length;  // its token's span in the line's string, and where the next one starts
+    float origin, next_x;                      // the line's left edge, and the next token's left edge
 };
 ProfilePrompt g_profile[4];
+int g_profile_button = -1;  // the profile prompt under the pointer, as of the last time it was looked at
+uint64_t g_profile_button_time = 0;
 
 bool ProfileActive(X86Context& ctx, uint32_t menu) {
     return int32_t(R(kFrontend)) > 100 && LiveMenu(menu) && R(menu + 4) == kProfileMenu &&
@@ -349,7 +355,10 @@ void NoteProfileText(X86Context& ctx) {
         while (stop > starts[i] && str[stop - 1] == ' ') stop--;
         float a = origin + MeasurePrefix(ctx, text, starts[i], ignored);
         float b = origin + MeasurePrefix(ctx, text, stop, ignored);
-        g_profile[buttons[i]] = {menu, row, R(row + 0x20), a, y, b - a, height, NowMs()};
+        uint32_t next = i + 1 < count ? starts[i + 1] : length;
+        float next_x = origin + MeasurePrefix(ctx, text, next, ignored);
+        g_profile[buttons[i]] = {menu, row, R(row + 0x20), a, y, b - a, height, NowMs(), text, starts[i], stop, next, length,
+                                 origin, next_x};
     }
 }
 
@@ -743,6 +752,13 @@ void CarouselInput(X86Context& ctx, Dispatch& d) {
 
 uint32_t g_trace_hit = 0;
 
+// the row the pointer is on, for the text drawn in it: its rectangle, and when it was last under the pointer
+struct HoverRow {
+    float left, top, right, bottom;
+    uint64_t time;
+};
+HoverRow g_hover_row{};
+
 uint32_t RowHit(uint32_t menu, float x, float y) {
     if (!InClip(menu, x, y)) return 0;
     uint32_t row = R(menu + 0x178);
@@ -810,6 +826,45 @@ uint32_t FindKey(uint32_t menu, int c, bool exact) {
     return 0;
 }
 
+// A character the keyboard on screen has on another page (a symbol, an accent, a capital on the lower page): the page the
+// character is on is set and the key's own callback (0x7DB20) run as if it were pressed there, so the limits, the
+// selection and the sounds are the game's; the page and the selected key are put back. The pages' characters are at
+// 0x4D8E74 and on (41 keys, 29 compact), five of them, the last two not in a name's. After the TimeSplitters Future
+// Perfect PC port.
+bool InsertChar(X86Context& ctx, uint32_t menu, int c) {
+    constexpr uint32_t kInsertKey = 0x7DB20, kKeyboardOnly = 0x4D94D4, kRefresh = 0x746D0;
+    static const uint32_t pages[2][5] = {{0x4D8E74, 0x4D8F44, 0x4D9014, 0x4D90E4, 0x4D91B4},
+                                         {0x4D9254, 0x4D92EC, 0x4D9384, 0x4D941C, 0x4D94B4}};
+    static const uint32_t modes[] = {0, 4, 8, 0x1000, 0x1004};
+    if (c < 0x20 || c > 0xFF || c == 0x7F || R(menu + 4) == kKeyboardOnly) return false;
+    bool has_key = false;
+    uint32_t row = R(menu + 0x178);
+    for (int n = 0; row && n < 256 && Valid(row, 0x10C) && !has_key; n++, row = R(row + 4)) has_key = R(row + 0x38) == kInsertKey;
+    uint32_t buffer = R(menu + 0x220), limit = R(menu + 0x230);
+    if (!has_key || !Valid(menu, 0x23C) || !limit || limit > 4096 || !Valid(buffer, limit + 1)) return false;
+    uint32_t length = 0;
+    while (length <= limit && R8(buffer + length)) length++;
+    if (length > limit || R(menu + 0x22C) > length) return false;
+    uint32_t flags = R(menu + 0x228), selected = R(menu + 0x18C);
+    uint32_t compact = (flags & 0x80) ? 1 : 0, count = compact ? 29 : 41;
+    for (uint32_t page = 0; page < 5; page++) {
+        if (page >= 3 && (flags & 0x4000)) continue;
+        for (uint32_t i = 0; i < count; i++) {
+            if (R8(pages[compact][page] + i) != c) continue;
+            X86Context saved = ctx;
+            W(menu + 0x228, (flags & ~0x100Eu) | modes[page]);
+            W(menu + 0x18C, i);
+            kernel::CallGuest(ctx, kInsertKey, {menu});
+            W(menu + 0x228, (R(menu + 0x228) & ~0x100Eu) | (flags & 0x100Eu));
+            W(menu + 0x18C, selected);
+            kernel::CallGuest(ctx, kRefresh, {menu});
+            ctx = saved;
+            return true;
+        }
+    }
+    return false;
+}
+
 // one typed character a tick: its key row selected and confirmed; a letter in the other case presses Shift first
 bool Typing(X86Context& ctx, uint32_t menu) {
     static int pending = 0, shifted = 0;
@@ -830,7 +885,7 @@ bool Typing(X86Context& ctx, uint32_t menu) {
     }
     if (!pending) shifted = 0;
     if (!row) row = FindKey(menu, c, false);
-    if (!row) return false;
+    if (!row) return InsertChar(ctx, menu, c);  // on another page of the keyboard
     if (R(menu + 0x198) != row) {
         X86Context saved = ctx;
         kernel::CallGuest(ctx, kSelectRow, {menu, row});
@@ -914,6 +969,21 @@ void Pointing(X86Context& ctx, uint32_t menu) {
     }
     if (DragSlider(ctx, menu, p, actions, x, y)) return;
     uint32_t hit = RowHit(menu, x, y);
+    g_hover_row = hit ? HoverRow{F(hit + 0x78), F(hit + 0x7C), F(hit + 0x80), F(hit + 0x84), NowMs()} : HoverRow{};
+    if (!hit && R(menu + 4) == kProfileMenu && InClip(menu, x, y)) {
+        // the profile screens' lists and prompts are rows of kinds the pointer does not pick: still lit under it
+        uint32_t row = R(menu + 0x178);
+        for (int n = 0; row && n < 256 && Valid(row, 0x10C); n++, row = R(row + 4))
+            if (!(R(row + 0x28) & 5) && x >= F(row + 0x78) && x < F(row + 0x80) && y >= F(row + 0x7C) && y < F(row + 0x84)) {
+                g_hover_row = {F(row + 0x78), F(row + 0x7C), F(row + 0x80), F(row + 0x84), NowMs()};
+                // a profile in the list (or Create New Profile) is picked like any row; the prompts are not rows to pick
+                int32_t id = int32_t(R(row + 0x14));
+                if (id != -4 && id != -5) hit = row;
+                break;
+            }
+    }
+    g_profile_button = R(menu + 4) == kProfileMenu ? ProfileHit(ctx, menu, x, y) : -1;
+    g_profile_button_time = NowMs();
     uint32_t direction = ArrowHit(menu, x, y, hit);
     static const bool trace = std::getenv("XBE_TRACE_MENU") != nullptr;
     if (trace && (actions & ~kHover || hit != g_trace_hit)) {
@@ -922,6 +992,9 @@ void Pointing(X86Context& ctx, uint32_t menu) {
              actions, hit, hit ? int(R(hit + 0x14)) : -1, direction, R(menu + 0x198));
     }
     // a click's first time in each menu kind, with the row it found: which menus a click does nothing in
+    if (hit && R(menu + 4) == kProfileMenu && (actions & kClick))
+        LOGR("menu: profile row %08X type %u id %d flags %X selected %08X", hit, R(hit), int(R(hit + 0x14)),
+             R(hit + 0x28), R(menu + 0x198));
     if (actions & kClick) {
         static uint32_t told[32], n_told = 0;
         uint32_t desc = R(menu + 4);
@@ -1031,6 +1104,80 @@ X86_FUNC(sub_00041DC0) {
         X86Context saved = ctx;
         hover = NoteText(ctx);
         ctx = saved;
+    }
+    if (!hover && g_hover_row.time && NowMs() - g_hover_row.time <= 100 && MenuContext()) {
+        // any text drawn within the row under the pointer, the profile and player screens' too
+        const HoverRow& r = g_hover_row;
+        float x = F(sp + 4), y = F(sp + 8);
+        hover = x >= r.left - 2 && x <= r.right + 2 && y >= r.top - 4 && y <= r.bottom;
+    }
+    // the profile screen's prompts share one string: the hovered one is drawn apart, in the highlight colour
+    if (kernel::R32(sp) == 0x763C3 && g_profile_button >= 0 && NowMs() - g_profile_button_time <= 100 && MenuContext()) {
+        const ProfilePrompt& f = g_profile[g_profile_button];
+        uint32_t text = R(sp + 12);
+        if (f.text == text && NowMs() - f.time <= 50 && f.start < f.stop && f.stop <= f.length) {
+            // the whole line is drawn three times where the game draws it (its centring and spacing are not worked out
+            // again), each clipped by the scissor to one part: the prompts before the pointed one, the pointed one in
+            // the highlight colour, and those after. The cuts are in the gaps between prompts, the first and the last
+            // reaching the line's ends
+            int spans[4], n = 0, at = -1;
+            for (int b = 0; b < 4; b++) {
+                const ProfilePrompt& o = g_profile[b];
+                if (o.text != text || NowMs() - o.time > 50 || o.start >= o.stop || o.stop > o.length) continue;
+                int k = n++;
+                while (k > 0 && g_profile[spans[k - 1]].x > o.x) {
+                    spans[k] = spans[k - 1];
+                    k--;
+                }
+                spans[k] = b;
+            }
+            for (int k = 0; k < n; k++)
+                if (spans[k] == g_profile_button) at = k;
+            if (at < 0) {
+                if (hover) W(sp + 16, kHighlight | (colour & 0xFF));
+                __imp__sub_00041DC0(ctx, base);
+                W(sp + 16, colour);
+                return;
+            }
+            auto edge = [&](int k) { return g_profile[spans[k]].x + g_profile[spans[k]].w; };
+            float scale = R(kCanvasW) ? 640.0f / float(R(kCanvasW)) : 1.0f;
+            int32_t left = at == 0 ? 0 : int32_t((edge(at - 1) + g_profile[spans[at]].x) * 0.5f * scale);
+            int32_t right = at == n - 1 ? 640 : int32_t((edge(at) + g_profile[spans[at + 1]].x) * 0.5f * scale);
+            gpu::State& state = d3d::State();
+            uint32_t had = state.scissor_count;
+            std::array<uint32_t, 4> kept{state.scissors[0], state.scissors[1], state.scissors[2], state.scissors[3]};
+            auto clip = [&](int32_t x0, int32_t x1) {
+                std::lock_guard<std::recursive_mutex> lock(d3d::Lock());
+                state.scissor_count = 1;
+                state.scissors[0] = uint32_t(std::max<int32_t>(x0, had ? int32_t(kept[0]) : 0));
+                state.scissors[1] = had ? kept[1] : 0;
+                state.scissors[2] = uint32_t(std::min<int32_t>(x1, had ? int32_t(kept[2]) : 639));
+                state.scissors[3] = had ? kept[3] : 479;
+            };
+            auto paint = [&](uint32_t c, X86Context& on) {
+                W(sp + 16, c);
+                __imp__sub_00041DC0(on, base);
+            };
+            if (left > 0) {
+                clip(0, left - 1);
+                X86Context copy = ctx;
+                paint(colour, copy);
+            }
+            clip(left, right - 1);
+            {
+                X86Context copy = ctx;
+                paint(kHighlight | (colour & 0xFF), copy);
+            }
+            clip(right, 639);
+            paint(colour, ctx);
+            {
+                std::lock_guard<std::recursive_mutex> lock(d3d::Lock());
+                state.scissor_count = had;
+                for (int i = 0; i < 4; i++) state.scissors[i] = kept[i];
+            }
+            W(sp + 16, colour);
+            return;
+        }
     }
     if (hover) W(sp + 16, kHighlight | (colour & 0xFF));
     __imp__sub_00041DC0(ctx, base);
