@@ -737,10 +737,10 @@ def world_matrices(model, pose):
     # a joint (kind 2) makes its matrix; a kind 3 node's "own" names one made elsewhere
     for nd in nodes:
         if nd["kind"] == 2 and nd["own"] not in worlds:
-            a = worlds.get(model.nodes_raw_own(nd["prev"]), ident())
-            b = worlds.get(model.nodes_raw_own(nd["next"]), ident())
-            q = slerp(mat_quat(a), mat_quat(b), nd["blend"] if 0 <= nd["blend"] <= 1 else 0.5)
-            worlds[nd["own"]] = qmat(q, (b[0][3], b[1][3], b[2][3]))
+            # at rest a joint's matrix is its next bone's (checked against the seams to the neighbouring pieces:
+            # within 2 to 9 degrees and a few cm on all of Cortez's joints; the old blend of the two bones' rotations
+            # was 100 to 180 degrees off the first bone's and twisted every joint-weighted part in Blender)
+            worlds[nd["own"]] = worlds.get(model.nodes_raw_own(nd["next"]), ident())
     for m in range(model.matrices):
         worlds.setdefault(m, ident())
     return worlds
